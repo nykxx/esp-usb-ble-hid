@@ -86,3 +86,14 @@ void ble_set_report_map_callback(report_map_callback_t callback);
 bool ble_write_output_report(uint8_t report_id, std::span<const uint8_t> data);
 /// Name of the subscribed device ("" if none or unknown).
 std::string ble_connected_name();
+/// What the subscribed device says about itself: its advertised GAP Appearance
+/// and, from the Device Information service (0x180A), its Manufacturer Name
+/// and PnP ID. Read when the Report Map is (see ble_set_report_map_callback);
+/// all empty / 0 when nothing is connected or a value is not available.
+struct BleDeviceInfo {
+  uint16_t appearance{0};   ///< GAP Appearance (e.g. 0x03C1 keyboard, 0x03C2 mouse)
+  std::string manufacturer; ///< Manufacturer Name String (0x2A29)
+  uint16_t vendor_id{0};    ///< PnP ID (0x2A50) vendor id
+  uint16_t product_id{0};   ///< PnP ID (0x2A50) product id
+};
+BleDeviceInfo ble_connected_device_info();

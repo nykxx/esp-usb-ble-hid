@@ -16,6 +16,7 @@
 #include <string>
 
 #include "ble.hpp"
+#include "bsp.hpp"
 #include "usb.hpp"
 
 /// Create the bridge state. Called once from app_main, after the services
@@ -43,3 +44,9 @@ void bridge_poll();
 /// A short label for the connected device ("" if none): shown on the display
 /// and reported to the console.
 std::string bridge_device_label();
+
+#if HAS_DISPLAY
+/// Called about once a second from the main loop, after the USB / BLE icons
+/// and the label are updated: the bridge may adapt the status screen.
+void bridge_update_display(Gui &gui);
+#endif

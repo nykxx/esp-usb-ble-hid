@@ -29,6 +29,10 @@
 #include "hid_descriptor.hpp"
 #include "status_led.hpp"
 
+#if HAS_DISPLAY
+#include "gui_icons.hpp"
+#endif
+
 using namespace std::chrono_literals;
 
 static espp::Logger logger({.tag = "HID Passthrough", .level = espp::Logger::Verbosity::INFO});
@@ -276,5 +280,40 @@ bool bridge_hid_ready() { return usb_is_mounted(); }
 void bridge_poll() {}
 
 std::string bridge_device_label() { return ble_connected_name(); }
+
+#if HAS_DISPLAY
+// GAP Appearance values (Bluetooth Assigned Numbers, HID category)
+static constexpr uint16_t kAppearanceMouse = 0x03C2;
+
+// A ZMK keyboard keeps ZMK's Device Information defaults unless its config
+// overrides them: Manufacturer "ZMK Project", PnP ID 1D50:615E.
+static bool is_zmk(const BleDeviceInfo &info) {
+  return info.manufacturer == "ZMK Project" ||
+         (info.vendor_id == 0x1D50 && info.product_id == 0x615E);
+}
+
+void bridge_update_display(Gui &gui) {
+  static bool layout_set = false;
+  if (!layout_set) {
+    // [device icon + BLE] <-> [computer + USB], the device's name below the arrow
+    gui.set_host_icon(&icon_computer);
+    gui.set_label_below_arrow(true);
+    layout_set = true;
+  }
+  const auto info = ble_connected_device_info();
+  const lv_image_dsc_t *icon = &icon_keyboard;
+  if (info.appearance == kAppearanceMouse)
+    icon = &icon_mouse;
+#if CONFIG_BRIDGE_HID_PASSTHROUGH_ZMK_LOGO
+  if (is_zmk(info))
+    icon = &icon_zmk_logo;
+#endif
+  static const lv_image_dsc_t *shown = nullptr;
+  if (icon != shown) {
+    gui.set_device_icon(icon);
+    shown = icon;
+  }
+}
+#endif // HAS_DISPLAY
 
 #endif // CONFIG_BRIDGE_MODE_HID_PASSTHROUGH

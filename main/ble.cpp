@@ -76,6 +76,13 @@ static NimBLEUUID report_map_uuid(espp::HidService::REPORT_MAP_UUID);
 // name of the subscribed device ("" when none), for the display
 static std::mutex connected_name_mutex;
 static std::string connected_name;
+// what the device says about itself (guarded by connected_name_mutex); the
+// appearance is captured from its advertisement when we decide to connect
+static BleDeviceInfo connected_info;
+static std::atomic<uint16_t> advertised_appearance{0};
+static NimBLEUUID device_info_service_uuid(espp::DeviceInfoService::SERVICE_UUID);
+static NimBLEUUID manufacturer_name_uuid(static_cast<uint16_t>(0x2A29));
+static NimBLEUUID pnp_id_uuid(static_cast<uint16_t>(0x2A50));
 
 // The controller's name, reported to the app once it is connected + subscribed
 // (see ble_set_bond_name_callback). The advertised name is captured when we
@@ -153,6 +160,7 @@ static void reset_link_state(const std::string &why) {
   {
     std::lock_guard<std::mutex> lk(connected_name_mutex);
     connected_name.clear();
+    connected_info = {};
   }
   set_link_detail(why);
   if (was_subscribed) {
@@ -356,6 +364,8 @@ class ScanCallbacks : public NimBLEScanCallbacks {
         std::lock_guard<std::mutex> lk(advertised_name_mutex);
         advertised_name = advertisedDevice->haveName() ? advertisedDevice->getName() : "";
       }
+      advertised_appearance =
+          advertisedDevice->haveAppearance() ? advertisedDevice->getAppearance() : 0;
 
       /** Async connections can be made directly in the scan callbacks */
       auto pClient = NimBLEDevice::getDisconnectedClient();
@@ -663,6 +673,32 @@ static bool timer_callback() {
     std::copy(id.getVal(), id.getVal() + address.size(), address.begin());
     bond_name_callback(address, id.getType(), name);
   }
+  // and, when the app wants the Report Map, what the device says about itself
+  if (report_map_callback) {
+    BleDeviceInfo info;
+    info.appearance = advertised_appearance.load();
+    if (auto *dis = pClient->getService(device_info_service_uuid)) {
+      if (auto *chr = dis->getCharacteristic(manufacturer_name_uuid); chr && chr->canRead()) {
+        for (const char c : std::string(chr->readValue())) {
+          if (static_cast<unsigned char>(c) >= 0x20 && static_cast<unsigned char>(c) < 0x7F)
+            info.manufacturer.push_back(c);
+        }
+      }
+      if (auto *chr = dis->getCharacteristic(pnp_id_uuid); chr && chr->canRead()) {
+        // [vendor id source][vendor id LE][product id LE][product version LE]
+        const auto value = chr->readValue();
+        if (value.size() >= 5) {
+          const uint8_t *v = value.data();
+          info.vendor_id = static_cast<uint16_t>(v[1] | (v[2] << 8));
+          info.product_id = static_cast<uint16_t>(v[3] | (v[4] << 8));
+        }
+      }
+    }
+    ble_logger.info("device: appearance {:#06x}, manufacturer '{}', PnP {:04x}:{:04x}",
+                    info.appearance, info.manufacturer, info.vendor_id, info.product_id);
+    std::lock_guard<std::mutex> lk(connected_name_mutex);
+    connected_info = info;
+  }
   // and hand the Report Map to the app (it mirrors it on USB)
   if (report_map_callback) {
     std::vector<uint8_t> map;
@@ -869,4 +905,9 @@ bool ble_write_output_report(uint8_t report_id, std::span<const uint8_t> data) {
 std::string ble_connected_name() {
   std::lock_guard<std::mutex> lk(connected_name_mutex);
   return connected_name;
+}
+
+BleDeviceInfo ble_connected_device_info() {
+  std::lock_guard<std::mutex> lk(connected_name_mutex);
+  return connected_info;
 }

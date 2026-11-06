@@ -65,6 +65,17 @@ menu "Bridge Configuration"
             string "USB product string"
             default "BLE HID Passthrough"
 
+        config BRIDGE_HID_PASSTHROUGH_ZMK_LOGO
+            bool "Show the ZMK logo for ZMK keyboards"
+            default n
+            help
+                On the status screen, show the ZMK logo instead of the generic
+                keyboard icon when the connected device is a ZMK keyboard
+                (Device Information: Manufacturer "ZMK Project" or PnP ID
+                1D50:615E, ZMK's defaults). The logo is ZMK's (MIT License,
+                The ZMK Contributors); ZMK publishes no policy on the use of
+                its name and logo, so this is off by default.
+
         config BRIDGE_HID_PASSTHROUGH_BOOT_KEYBOARD
             bool "Add a boot keyboard for BIOS / UEFI"
             default y

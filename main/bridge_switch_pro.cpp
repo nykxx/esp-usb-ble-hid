@@ -347,4 +347,10 @@ void bridge_poll() {
 
 std::string bridge_device_label() { return get_serial_number(); }
 
+#if HAS_DISPLAY
+void bridge_update_display(Gui &) {
+  // the default status screen (Xbox controller -> Switch) is this mode's
+}
+#endif
+
 #endif // CONFIG_BRIDGE_MODE_SWITCH_PRO

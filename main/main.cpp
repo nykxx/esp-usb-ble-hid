@@ -280,6 +280,7 @@ extern "C" void app_main(void) {
     bridge_poll();
 #if HAS_DISPLAY
     gui->set_label_text(bridge_device_label());
+    bridge_update_display(*gui);
 #endif // HAS_DISPLAY
   }
 }
