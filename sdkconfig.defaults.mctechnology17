@@ -1,0 +1,7 @@
+# Personal build defaults (mctechnology17), on top of the HID passthrough ones:
+#
+#   idf.py -D SDKCONFIG_DEFAULTS="sdkconfig.defaults;sdkconfig.defaults.hid_passthrough;sdkconfig.defaults.mctechnology17" \
+#          -D DONGLE_EXTRA_COMPONENT_DIRS=components_hid_passthrough build
+#
+# Not meant for upstream.
+CONFIG_BRIDGE_HID_PASSTHROUGH_ZMK_LOGO=y
