@@ -16,6 +16,22 @@ menu "Hardware Configuration"
     endchoice
 endmenu
 
+menu "Bridge Configuration"
+    choice BRIDGE_MODE
+        prompt "Bridge mode"
+        default BRIDGE_MODE_SWITCH_PRO
+        help
+            Select what the dongle bridges from BLE to USB.
+
+        config BRIDGE_MODE_SWITCH_PRO
+            bool "Xbox controller -> Switch Pro controller"
+            help
+                Pairs with an Xbox (BLE) controller and presents a wired
+                Nintendo Switch Pro controller on USB.
+
+    endchoice
+endmenu
+
 menu "USB Configuration"
     config DONGLE_USB_VENDOR_INTERFACE
         bool "Add a vendor (WebUSB) interface for the dongle console"
