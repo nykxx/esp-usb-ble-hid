@@ -9,6 +9,7 @@
 
 #include <cstdint>
 #include <functional>
+#include <optional>
 #include <span>
 #include <string>
 #include <system_error>
@@ -46,6 +47,8 @@ struct UsbHidConfig {
   bool remote_wakeup{true};
   /// The HID function; its on_receive runs on the TinyUSB task (must not block).
   espp::UsbDevice::HidFunction hid;
+  /// Optional boot keyboard (BIOS / UEFI), presented as interface 0.
+  std::optional<espp::UsbDevice::HidFunction> boot_hid;
   /// Called (TinyUSB task) when the host configures / drops the device.
   std::function<void()> on_mount{nullptr};
   std::function<void()> on_unmount{nullptr};
@@ -61,6 +64,12 @@ bool usb_is_mounted();
 /// std::errc::resource_unavailable_try_again while the previous report is still
 /// in flight. Do not call from the TinyUSB task when retrying.
 bool usb_write_hid_report(uint8_t report_id, std::span<const uint8_t> report, std::error_code &ec);
+
+/// Send one boot keyboard report (8 bytes, no report id); errors as above.
+bool usb_write_boot_hid_report(std::span<const uint8_t> report, std::error_code &ec);
+
+/// Whether the host drives the boot keyboard in boot protocol (BIOS / UEFI).
+bool usb_boot_protocol_active();
 
 /// Input reports accepted by the USB stack since boot (diagnostics).
 uint32_t usb_hid_reports_sent();

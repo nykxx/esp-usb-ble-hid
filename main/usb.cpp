@@ -84,6 +84,30 @@ bool usb_write_hid_report(uint8_t report_id, std::span<const uint8_t> report, st
   return true;
 }
 
+// The boot keyboard needs the espp/usb_device copy in
+// components_hid_passthrough/ (boot HID function, see its PATCHES.md).
+#if CONFIG_BRIDGE_HID_PASSTHROUGH_BOOT_KEYBOARD
+bool usb_write_boot_hid_report(std::span<const uint8_t> report, std::error_code &ec) {
+  if (!usb) {
+    ec = std::make_error_code(std::errc::not_connected);
+    return false;
+  }
+  if (!usb->write_boot_hid_report(report, ec))
+    return false;
+  hid_reports_sent.fetch_add(1);
+  return true;
+}
+
+bool usb_boot_protocol_active() { return usb && usb->boot_hid_protocol_active(); }
+#else
+bool usb_write_boot_hid_report(std::span<const uint8_t>, std::error_code &ec) {
+  ec = std::make_error_code(std::errc::function_not_supported);
+  return false;
+}
+
+bool usb_boot_protocol_active() { return false; }
+#endif // CONFIG_BRIDGE_HID_PASSTHROUGH_BOOT_KEYBOARD
+
 void usb_reenumerate() {
   tud_disconnect();
   std::this_thread::sleep_for(20ms);
@@ -126,6 +150,9 @@ bool start_usb(const UsbHidConfig &config) {
   cfg.max_power_ma = config.max_power_ma;
   cfg.remote_wakeup = config.remote_wakeup;
   cfg.hid = config.hid;
+#if CONFIG_BRIDGE_HID_PASSTHROUGH_BOOT_KEYBOARD
+  cfg.boot_hid = config.boot_hid;
+#endif
 
 #if CONFIG_DONGLE_USB_VENDOR_INTERFACE
   espp::UsbDevice::VendorFunction vendor;

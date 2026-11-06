@@ -8,3 +8,5 @@
 # keyboard (BIOS / UEFI) support; see its PATCHES.md.
 #
 CONFIG_BRIDGE_MODE_HID_PASSTHROUGH=y
+# the passthrough HID interface + the boot keyboard (BIOS / UEFI)
+CONFIG_TINYUSB_HID_COUNT=2

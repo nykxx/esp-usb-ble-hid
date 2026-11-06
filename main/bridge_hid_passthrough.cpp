@@ -1,6 +1,12 @@
 // Bridge mode: any BLE HID device (keyboard, mouse, ...) -> the same HID device
 // on USB. The USB report descriptor mirrors the device's Report Map, so every
 // input report is forwarded as is, with its report id (see hid_descriptor.hpp).
+//
+// Optionally (CONFIG_BRIDGE_HID_PASSTHROUGH_BOOT_KEYBOARD) a boot keyboard is
+// presented as well, for BIOS / UEFI hosts. It stays silent unless the host
+// selects the boot protocol (SET_PROTOCOL(BOOT), which an operating system
+// does not do); then the device's keyboard reports are rebuilt in the boot
+// format and sent there instead, so keys are never delivered twice.
 #include "sdkconfig.h"
 #if CONFIG_BRIDGE_MODE_HID_PASSTHROUGH
 
@@ -11,6 +17,7 @@
 #include <deque>
 #include <map>
 #include <mutex>
+#include <optional>
 #include <thread>
 #include <vector>
 
@@ -36,12 +43,17 @@ static constexpr uint32_t kMaxDescriptorRestarts = 2;
 
 static uint8_t usb_report_id(uint8_t ble_report_id) { return uses_report_ids ? ble_report_id : 0; }
 
+// where the keys are in the device's keyboard report (from its Report Map),
+// for the boot keyboard; nullopt without a boot keyboard or a keyboard report
+static std::optional<HidKeyboardLayout> keyboard_layout;
+
 /********* BLE -> USB: input reports ***************/
 
 // BLE notifications arrive on the NimBLE host task; they are queued and sent
 // from one sender task, in order (a key press must never overtake its
 // release), waiting for the interrupt IN endpoint to drain between reports.
 struct InReport {
+  bool boot{false}; // for the boot keyboard (no report id) instead of the HID function
   uint8_t id{0};
   std::vector<uint8_t> data;
 };
@@ -66,7 +78,11 @@ static bool hid_sender_fn(std::mutex &, std::condition_variable &) {
     return false; // nobody to send to
   const auto deadline = std::chrono::steady_clock::now() + kSendTimeout;
   std::error_code ec;
-  while (!usb_write_hid_report(rep.id, rep.data, ec)) {
+  auto write = [&]() {
+    return rep.boot ? usb_write_boot_hid_report(rep.data, ec)
+                    : usb_write_hid_report(rep.id, rep.data, ec);
+  };
+  while (!write()) {
     if (ec != std::errc::resource_unavailable_try_again ||
         std::chrono::steady_clock::now() >= deadline) {
       logger.warn_rate_limited("dropped HID report id {} ({})", rep.id, ec.message());
@@ -77,7 +93,7 @@ static bool hid_sender_fn(std::mutex &, std::condition_variable &) {
   return false; // don't stop the task
 }
 
-static void enqueue_hid(uint8_t report_id, std::span<const uint8_t> report) {
+static void enqueue_hid(uint8_t report_id, std::span<const uint8_t> report, bool boot = false) {
   if (!usb_is_mounted())
     return;
   {
@@ -86,7 +102,7 @@ static void enqueue_hid(uint8_t report_id, std::span<const uint8_t> report) {
       logger.warn_rate_limited("HID queue full; dropping report id {}", report_id);
       return;
     }
-    hid_tx_queue.push_back({report_id, std::vector<uint8_t>(report.begin(), report.end())});
+    hid_tx_queue.push_back({boot, report_id, std::vector<uint8_t>(report.begin(), report.end())});
   }
   hid_tx_cv.notify_one();
 }
@@ -183,6 +199,31 @@ UsbHidConfig bridge_usb_config() {
     }
     output_cv.notify_one();
   };
+#if CONFIG_BRIDGE_HID_PASSTHROUGH_BOOT_KEYBOARD
+  keyboard_layout = hid_descriptor_keyboard_layout(cfg.hid.report_descriptor);
+  if (keyboard_layout) {
+    logger.info("boot keyboard: keyboard report id {}", keyboard_layout->report_id);
+  } else {
+    logger.warn("boot keyboard: no keyboard report in the descriptor; boot keys disabled");
+  }
+  espp::UsbDevice::HidFunction boot;
+  boot.interface_name = "BLE HID Boot Keyboard";
+  const auto boot_descriptor = hid_boot_keyboard_descriptor();
+  boot.report_descriptor.assign(boot_descriptor.begin(), boot_descriptor.end());
+  boot.boot_protocol = 1; // keyboard
+  boot.poll_interval_ms = 8;
+  boot.on_receive = [](std::span<const uint8_t> data) {
+    // the BIOS' LED state (no report id): to the device's keyboard output report
+    if (data.empty() || !keyboard_layout)
+      return;
+    {
+      std::lock_guard<std::mutex> lk(output_mutex);
+      pending_output[keyboard_layout->report_id].assign(data.begin(), data.end());
+    }
+    output_cv.notify_one();
+  };
+  cfg.boot_hid = boot;
+#endif // CONFIG_BRIDGE_HID_PASSTHROUGH_BOOT_KEYBOARD
   cfg.on_unmount = []() {
     std::lock_guard<std::mutex> lock(hid_tx_mutex);
     hid_tx_queue.clear();
@@ -192,12 +233,20 @@ UsbHidConfig bridge_usb_config() {
 
 void bridge_on_ble_report(NimBLERemoteCharacteristic *chr, const uint8_t *data, size_t length) {
   // its report id comes from the characteristic's Report Reference
-  const uint8_t id = usb_report_id(ble_report_id_for(chr).value_or(1));
+  const uint8_t ble_id = ble_report_id_for(chr).value_or(1);
+  const std::span<const uint8_t> report(data, length);
+  if (keyboard_layout && ble_id == keyboard_layout->report_id && usb_boot_protocol_active()) {
+    // a BIOS / UEFI host: the keyboard goes to the boot keyboard only
+    const auto boot = hid_boot_keyboard_report(*keyboard_layout, report);
+    enqueue_hid(0, boot, true);
+    return;
+  }
+  const uint8_t id = usb_report_id(ble_id);
   {
     std::lock_guard<std::mutex> lk(sent_lengths_mutex);
     sent_lengths[id] = length;
   }
-  enqueue_hid(id, std::span<const uint8_t>(data, length));
+  enqueue_hid(id, report);
 }
 
 void bridge_on_ble_battery(uint8_t) {
@@ -215,6 +264,10 @@ void bridge_on_ble_disconnect() {
   for (const auto &[id, len] : lengths) {
     const std::vector<uint8_t> zeros(len, 0);
     enqueue_hid(id, zeros);
+  }
+  if (keyboard_layout && usb_boot_protocol_active()) {
+    const std::array<uint8_t, 8> released{};
+    enqueue_hid(0, released, true);
   }
 }
 

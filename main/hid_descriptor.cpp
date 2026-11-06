@@ -166,4 +166,197 @@ void hid_descriptor_reset_restart_count() {
   restart_count = 0;
 }
 
+// --- boot keyboard (BIOS / UEFI) ---------------------------------------------------
+
+static const uint8_t kBootKeyboardDescriptor[] = {
+    0x05, 0x01,       // Usage Page (Generic Desktop)
+    0x09, 0x06,       // Usage (Keyboard)
+    0xA1, 0x01,       // Collection (Application)
+    0x05, 0x07,       //   Usage Page (Keyboard/Keypad)
+    0x19, 0xE0,       //   Usage Minimum (Left Control)
+    0x29, 0xE7,       //   Usage Maximum (Right GUI)
+    0x15, 0x00,       //   Logical Minimum (0)
+    0x25, 0x01,       //   Logical Maximum (1)
+    0x75, 0x01,       //   Report Size (1)
+    0x95, 0x08,       //   Report Count (8)
+    0x81, 0x02,       //   Input (Data, Var, Abs)
+    0x75, 0x08,       //   Report Size (8)
+    0x95, 0x01,       //   Report Count (1)
+    0x81, 0x01,       //   Input (Const)
+    0x05, 0x08,       //   Usage Page (LEDs)
+    0x19, 0x01,       //   Usage Minimum (Num Lock)
+    0x29, 0x05,       //   Usage Maximum (Kana)
+    0x75, 0x01,       //   Report Size (1)
+    0x95, 0x05,       //   Report Count (5)
+    0x91, 0x02,       //   Output (Data, Var, Abs)
+    0x75, 0x03,       //   Report Size (3)
+    0x95, 0x01,       //   Report Count (1)
+    0x91, 0x01,       //   Output (Const)
+    0x05, 0x07,       //   Usage Page (Keyboard/Keypad)
+    0x15, 0x00,       //   Logical Minimum (0)
+    0x26, 0xFF, 0x00, //   Logical Maximum (255)
+    0x19, 0x00,       //   Usage Minimum (0)
+    0x29, 0xFF,       //   Usage Maximum (255)
+    0x75, 0x08,       //   Report Size (8)
+    0x95, 0x06,       //   Report Count (6)
+    0x81, 0x00,       //   Input (Data, Array, Abs)
+    0xC0,             // End Collection
+};
+
+std::span<const uint8_t> hid_boot_keyboard_descriptor() { return kBootKeyboardDescriptor; }
+
+static constexpr uint16_t kUsagePageKeyboard = 0x07;
+static constexpr uint16_t kUsageLeftControl = 0xE0;
+static constexpr uint16_t kUsageRightGui = 0xE7;
+static constexpr uint8_t kErrorRollOver = 0x01;
+
+std::optional<HidKeyboardLayout> hid_descriptor_keyboard_layout(std::span<const uint8_t> d) {
+  // Only what locating the keyboard fields needs: global state (with
+  // Push / Pop), the local usages of the next main item, and the running bit
+  // offset of every input report.
+  struct Globals {
+    uint16_t usage_page{0};
+    uint32_t report_size{0};
+    uint32_t report_count{0};
+    uint8_t report_id{0};
+  };
+  Globals g;
+  std::vector<Globals> stack;
+  uint32_t usage_min = 0, usage_max = 0;
+  bool have_range = false;
+  std::array<uint32_t, 256> input_bits{}; // per report id
+  HidKeyboardLayout layout;
+  bool found = false;
+
+  for (size_t i = 0; i < d.size();) {
+    const uint8_t prefix = d[i];
+    if (prefix == 0xFE) { // long item: [0xFE][size][tag][data...]
+      if (i + 1 >= d.size())
+        break;
+      i += 3 + d[i + 1];
+      continue;
+    }
+    const size_t size = (prefix & 0x03) == 3 ? 4 : (prefix & 0x03);
+    if (i + 1 + size > d.size())
+      break;
+    uint32_t value = 0;
+    for (size_t b = 0; b < size; ++b)
+      value |= static_cast<uint32_t>(d[i + 1 + b]) << (8 * b);
+    const uint8_t type = (prefix >> 2) & 0x03;
+    const uint8_t tag = prefix >> 4;
+    i += 1 + size;
+
+    if (type == 1) { // global
+      switch (tag) {
+      case 0x0:
+        g.usage_page = static_cast<uint16_t>(value);
+        break;
+      case 0x7:
+        g.report_size = value;
+        break;
+      case 0x8:
+        g.report_id = static_cast<uint8_t>(value);
+        break;
+      case 0x9:
+        g.report_count = value;
+        break;
+      case 0xA:
+        stack.push_back(g);
+        break;
+      case 0xB:
+        if (!stack.empty()) {
+          g = stack.back();
+          stack.pop_back();
+        }
+        break;
+      default:
+        break;
+      }
+    } else if (type == 2) { // local
+      if (tag == 0x1) {
+        usage_min = value;
+        have_range = true;
+      } else if (tag == 0x2) {
+        usage_max = value;
+      }
+    } else if (type == 0) { // main
+      if (tag == 0x8) {     // Input
+        uint32_t &bits = input_bits[g.report_id];
+        const bool constant = value & 0x01;
+        const bool variable = value & 0x02;
+        const bool same_report = !found || g.report_id == layout.report_id;
+        if (!constant && g.usage_page == kUsagePageKeyboard && same_report) {
+          if (variable && g.report_size == 1 && have_range && usage_min == kUsageLeftControl &&
+              usage_max == kUsageRightGui && g.report_count == 8 && layout.modifiers_bit < 0) {
+            layout.modifiers_bit = static_cast<int>(bits);
+          } else if (!variable && g.report_size == 8 && layout.keys_bit < 0) {
+            layout.keys_bit = static_cast<int>(bits);
+            layout.keys_count = static_cast<uint8_t>(std::min<uint32_t>(g.report_count, 255));
+          } else if (variable && g.report_size == 1 && have_range && usage_max > usage_min &&
+                     layout.bitmap_bit < 0) {
+            layout.bitmap_bit = static_cast<int>(bits);
+            layout.bitmap_usage_min = static_cast<uint16_t>(usage_min);
+            layout.bitmap_count = static_cast<uint16_t>(g.report_count);
+          }
+          if (!found) {
+            found = true;
+            layout.report_id = g.report_id;
+          }
+        }
+        bits += g.report_size * g.report_count;
+      }
+      // every main item (and a collection) ends the local items
+      usage_min = usage_max = 0;
+      have_range = false;
+    }
+  }
+  if (!found || (layout.keys_bit < 0 && layout.bitmap_bit < 0))
+    return std::nullopt;
+  return layout;
+}
+
+static bool bit_at(std::span<const uint8_t> data, uint32_t bit) {
+  const uint32_t byte = bit / 8;
+  return byte < data.size() && (data[byte] >> (bit % 8)) & 1;
+}
+
+static uint8_t byte_at(std::span<const uint8_t> data, uint32_t bit) {
+  uint8_t value = 0;
+  for (int b = 0; b < 8; ++b)
+    value |= static_cast<uint8_t>(bit_at(data, bit + b)) << b;
+  return value;
+}
+
+std::array<uint8_t, 8> hid_boot_keyboard_report(const HidKeyboardLayout &layout,
+                                                std::span<const uint8_t> report) {
+  std::array<uint8_t, 8> boot{};
+  if (layout.modifiers_bit >= 0)
+    boot[0] = byte_at(report, layout.modifiers_bit);
+  size_t keys = 0;
+  bool rollover = false;
+  auto add_key = [&](uint16_t usage) {
+    if (usage >= kUsageLeftControl && usage <= kUsageRightGui) {
+      boot[0] |= static_cast<uint8_t>(1 << (usage - kUsageLeftControl));
+    } else if (usage > kErrorRollOver && usage <= 0xFF) {
+      if (keys < 6)
+        boot[2 + keys++] = static_cast<uint8_t>(usage);
+      else
+        rollover = true;
+    }
+  };
+  if (layout.keys_bit >= 0) {
+    for (uint32_t k = 0; k < layout.keys_count; ++k)
+      add_key(byte_at(report, layout.keys_bit + 8 * k));
+  }
+  if (layout.bitmap_bit >= 0) {
+    for (uint32_t k = 0; k < layout.bitmap_count; ++k) {
+      if (bit_at(report, layout.bitmap_bit + k))
+        add_key(static_cast<uint16_t>(layout.bitmap_usage_min + k));
+    }
+  }
+  if (rollover)
+    std::fill(boot.begin() + 2, boot.end(), kErrorRollOver);
+  return boot;
+}
+
 #endif // CONFIG_BRIDGE_MODE_HID_PASSTHROUGH

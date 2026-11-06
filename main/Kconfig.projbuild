@@ -64,6 +64,17 @@ menu "Bridge Configuration"
         config DONGLE_USB_PRODUCT
             string "USB product string"
             default "BLE HID Passthrough"
+
+        config BRIDGE_HID_PASSTHROUGH_BOOT_KEYBOARD
+            bool "Add a boot keyboard for BIOS / UEFI"
+            default y
+            help
+                Presents a boot keyboard (interface 0) next to the passthrough
+                HID interface, so the device's keyboard also works in a BIOS /
+                UEFI setup or boot menu. It only sends keys when the host
+                selects the boot protocol; an operating system keeps using the
+                passthrough interface. Needs CONFIG_TINYUSB_HID_COUNT=2 (set
+                by sdkconfig.defaults.hid_passthrough).
     endif
 endmenu
 
