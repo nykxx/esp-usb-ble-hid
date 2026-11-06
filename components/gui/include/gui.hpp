@@ -42,6 +42,17 @@ public:
   void set_usb_connected(bool connected);
   void set_ble_connected(bool connected);
 
+  /// Replace the image above the BLE icon (default: the Xbox controller).
+  /// The image is drawn as is (no recolor), e.g. a full-color logo.
+  void set_device_icon(const lv_image_dsc_t *icon);
+
+  /// Replace the image above the USB icon (default: the Switch).
+  void set_host_icon(const lv_image_dsc_t *icon);
+
+  /// Show the label below the arrow, between the two icon columns (e.g. the
+  /// connected device's name), instead of centered over the whole screen.
+  void set_label_below_arrow(bool below);
+
   void set_label_text(std::string_view text) {
     std::lock_guard<std::recursive_mutex> lk(mutex_);
     lv_label_set_text(label_, text.data());
