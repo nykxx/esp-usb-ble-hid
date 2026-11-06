@@ -1,0 +1,39 @@
+# Local copy (see PATCHES.md). esp_tinyusb / tinyusb are pinned to the
+# versions in the project's dependencies.lock: this copy is written against the
+# esp_tinyusb 2.x API (3.x is a breaking release).
+dependencies:
+  espp/base_component: '>=1.0'
+  espressif/esp_tinyusb: '2.3.0'
+  idf:
+    version: '>=5.0'
+  tinyusb:
+    public: true
+    version: '0.21.0~2'
+description: 'Composable native USB device (esp_tinyusb): CDC-ACM, vendor-specific/WebUSB,
+  HID, X-Input and mass storage (MSC) with configurable VID/PID for ESP-IDF'
+documentation: https://esp-cpp.github.io/espp/buses/usb_cdc.html
+license: MIT
+maintainers:
+- William Emfinger <waemfinger@gmail.com>
+repository: git://github.com/esp-cpp/espp.git
+repository_info:
+  commit_sha: 46f046f73e2dbdf23cbed19b25bff1aed5647e9a
+  path: components/usb_device
+tags:
+- cpp
+- Component
+- USB
+- CDC
+- Vendor
+- WebUSB
+- TinyUSB
+- Serial
+- Transport
+- HID
+- XInput
+- Gamepad
+- MSC
+- Mass-Storage
+- SD-Card
+url: https://github.com/esp-cpp/espp/tree/main/components/usb_device
+version: 1.3.6

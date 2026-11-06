@@ -1,6 +1,10 @@
 # Extra defaults for the HID passthrough bridge (any BLE keyboard / mouse ->
 # the same HID device on USB). Build with:
 #
-#   idf.py -D SDKCONFIG_DEFAULTS="sdkconfig.defaults;sdkconfig.defaults.hid_passthrough" build
+#   idf.py -D SDKCONFIG_DEFAULTS="sdkconfig.defaults;sdkconfig.defaults.hid_passthrough" \
+#          -D DONGLE_EXTRA_COMPONENT_DIRS=components_hid_passthrough build
+#
+# components_hid_passthrough/ holds a copy of espp/usb_device with the boot
+# keyboard (BIOS / UEFI) support; see its PATCHES.md.
 #
 CONFIG_BRIDGE_MODE_HID_PASSTHROUGH=y

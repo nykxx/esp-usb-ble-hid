@@ -9,6 +9,14 @@ set(EXTRA_COMPONENT_DIRS
   "components/"
 )
 
+# optional extra component directories for a build variant (e.g. the HID
+# passthrough build, see sdkconfig.defaults.hid_passthrough), with their own
+# lock file so the default dependencies.lock is left alone
+if(DONGLE_EXTRA_COMPONENT_DIRS)
+  list(APPEND EXTRA_COMPONENT_DIRS ${DONGLE_EXTRA_COMPONENT_DIRS})
+  idf_build_set_property(DEPENDENCIES_LOCK "${CMAKE_SOURCE_DIR}/dependencies.hid_passthrough.lock")
+endif()
+
 set(
   COMPONENTS
   "main esptool_py driver logger math task hid-rp hid_service esp-nimble-cpp ble_gatt_server espcoredump gui qtpy t-dongle-s3 xbox switch_pro usb_device esp_tinyusb stream_frame dispatcher ota coredump nvs device_config app_update"
