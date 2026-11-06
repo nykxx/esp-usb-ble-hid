@@ -4,6 +4,7 @@
 #include <cstdint>
 #include <functional>
 #include <optional>
+#include <span>
 #include <string>
 #include <vector>
 
@@ -75,3 +76,13 @@ bool ble_forget_bond(const std::array<uint8_t, 6> &address, uint8_t address_type
 /// the bond store could not be cleared (bonds may remain).
 bool ble_clear_bonds();
 std::string get_connected_client_serial_number();
+/// Called (from the BLE scan-timer task) once a device is subscribed, with its
+/// HID Report Map (empty if it could not be read).
+using report_map_callback_t = std::function<void(const std::vector<uint8_t> &report_map)>;
+void ble_set_report_map_callback(report_map_callback_t callback);
+/// Write a host -> device output report (e.g. keyboard LEDs) to the subscribed
+/// device. `data` excludes the report id. Returns false if there is no such
+/// output report. May block briefly: do not call from the TinyUSB task.
+bool ble_write_output_report(uint8_t report_id, std::span<const uint8_t> data);
+/// Name of the subscribed device ("" if none or unknown).
+std::string ble_connected_name();

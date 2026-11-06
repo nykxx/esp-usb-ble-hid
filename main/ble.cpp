@@ -6,6 +6,7 @@
 #include <unordered_map>
 
 #include "esp_timer.h"
+#include "sdkconfig.h"
 
 #include "ble.hpp"
 #include "bsp.hpp"
@@ -66,6 +67,15 @@ static disconnect_callback_t disconnect_callback = nullptr;
 // on disconnect (the characteristic objects die with the client).
 static std::mutex report_map_mutex;
 static std::unordered_map<const NimBLERemoteCharacteristic *, uint8_t> report_ids;
+// Output reports (host -> device, e.g. keyboard LEDs) by report id, and the
+// device's Report Map; both guarded by report_map_mutex, cleared on disconnect.
+static std::unordered_map<uint8_t, NimBLERemoteCharacteristic *> output_reports;
+static std::vector<uint8_t> remote_report_map;
+static report_map_callback_t report_map_callback = nullptr;
+static NimBLEUUID report_map_uuid(espp::HidService::REPORT_MAP_UUID);
+// name of the subscribed device ("" when none), for the display
+static std::mutex connected_name_mutex;
+static std::string connected_name;
 
 // The controller's name, reported to the app once it is connected + subscribed
 // (see ble_set_bond_name_callback). The advertised name is captured when we
@@ -94,6 +104,14 @@ static constexpr int64_t kScanRetryUs = 500 * 1000;            // don't hammer a
 static constexpr int64_t kPairingWindowUs = 30 * 1000 * 1000;  // a pairing scan accepts new
                                                                // controllers for this long
 static constexpr uint8_t kMaxSubscribeAttempts = 10;           // ~500 ms apart
+
+// The scan timer runs the whole link bring-up (GATT discovery, reads, NVS
+// writes); reading the HID Report Map as well overflows the default stack.
+#if CONFIG_BRIDGE_MODE_HID_PASSTHROUGH
+static constexpr size_t kScanTimerStackSize = 8192;
+#else
+static constexpr size_t kScanTimerStackSize = 4096;
+#endif
 
 // Read the connected controller's name: GAP Device Name, else the name it
 // advertised, else "". Control characters are stripped and the result capped
@@ -129,6 +147,12 @@ static void reset_link_state(const std::string &why) {
   {
     std::lock_guard<std::mutex> lk(report_map_mutex);
     report_ids.clear();
+    output_reports.clear();
+    remote_report_map.clear();
+  }
+  {
+    std::lock_guard<std::mutex> lk(connected_name_mutex);
+    connected_name.clear();
   }
   set_link_detail(why);
   if (was_subscribed) {
@@ -407,6 +431,7 @@ static size_t subscribe_input_reports(NimBLEClient *client, std::string &why) {
     // the previous attempt's (dangling) entries
     std::lock_guard<std::mutex> lk(report_map_mutex);
     report_ids.clear();
+    output_reports.clear();
   }
   const auto &services = client->getServices(refresh);
   auto *svc = client->getService(hid_service_uuid);
@@ -416,8 +441,23 @@ static size_t subscribe_input_reports(NimBLEClient *client, std::string &why) {
   }
   size_t count = 0, report_chars = 0, failed = 0;
   for (auto *chr : svc->getCharacteristics(refresh)) {
-    if (chr->getUUID() != hid_input_uuid || !chr->canNotify())
+    if (chr->getUUID() != hid_input_uuid)
       continue;
+    if (!chr->canNotify()) {
+      // an output report (e.g. keyboard LEDs): remember it by report id, when
+      // the app forwards the host's output reports (it asked for the Report Map)
+      if (auto *ref = report_map_callback ? chr->getDescriptor(report_reference_uuid) : nullptr) {
+        const auto value = ref->readValue();
+        if (value.size() >= 2 && value.data()[1] == 2 &&
+            (chr->canWrite() || chr->canWriteNoResponse())) {
+          std::lock_guard<std::mutex> lk(report_map_mutex);
+          output_reports[value.data()[0]] = chr;
+          ble_logger.info("HID output report id {} (handle {:#06x})", value.data()[0],
+                          chr->getHandle());
+        }
+      }
+      continue;
+    }
     ++report_chars;
     uint8_t report_id = 1;
     if (auto *ref = chr->getDescriptor(report_reference_uuid)) {
@@ -446,7 +486,19 @@ static size_t subscribe_input_reports(NimBLEClient *client, std::string &why) {
     why = fmt::format("subscribing to {} of {} input reports failed", failed, count + failed);
     std::lock_guard<std::mutex> lk(report_map_mutex);
     report_ids.clear(); // the next attempt subscribes them all again
+    output_reports.clear();
     return 0;
+  }
+  if (count > 0 && report_map_callback) {
+    // the HID descriptor the reports follow, mirrored on USB by the app
+    std::vector<uint8_t> map;
+    if (auto *chr = svc->getCharacteristic(report_map_uuid); chr && chr->canRead()) {
+      const auto value = chr->readValue();
+      map.assign(value.data(), value.data() + value.size());
+    }
+    ble_logger.info("Report Map: {} bytes", map.size());
+    std::lock_guard<std::mutex> lk(report_map_mutex);
+    remote_report_map = std::move(map);
   }
   if (count == 0) {
     if (report_chars == 0)
@@ -599,12 +651,26 @@ static bool timer_callback() {
       pBatteryChr->subscribe(pBatteryChr->canNotify(), on_notify);
     }
   }
-  // and report the controller's name for the paired-controller list
+  // and report the device's name for the paired-device list and the display
+  const std::string name = read_controller_name(pClient);
+  {
+    std::lock_guard<std::mutex> lk(connected_name_mutex);
+    connected_name = name;
+  }
   if (bond_name_callback) {
     const NimBLEAddress id = pClient->getConnInfo().getIdAddress();
     std::array<uint8_t, 6> address{};
     std::copy(id.getVal(), id.getVal() + address.size(), address.begin());
-    bond_name_callback(address, id.getType(), read_controller_name(pClient));
+    bond_name_callback(address, id.getType(), name);
+  }
+  // and hand the Report Map to the app (it mirrors it on USB)
+  if (report_map_callback) {
+    std::vector<uint8_t> map;
+    {
+      std::lock_guard<std::mutex> lk(report_map_mutex);
+      map = remote_report_map;
+    }
+    report_map_callback(map);
   }
   return false; // don't stop the timer
 }
@@ -668,6 +734,7 @@ static void start_scan(bool pairing) {
         espp::Timer::Config{.name = "Scan Timer",
                             .period = 100ms,
                             .callback = timer_callback,
+                            .stack_size_bytes = kScanTimerStackSize,
                             .log_level = espp::Logger::Verbosity::INFO});
   }
 }
@@ -777,4 +844,29 @@ bool ble_clear_bonds() {
   }
   reset_link_state("all bonds cleared");
   return NimBLEDevice::deleteAllBonds();
+}
+
+void ble_set_report_map_callback(report_map_callback_t callback) {
+  report_map_callback = std::move(callback); // set once at startup, before scanning
+}
+
+bool ble_write_output_report(uint8_t report_id, std::span<const uint8_t> data) {
+  if (!subscribed)
+    return false;
+  NimBLERemoteCharacteristic *chr = nullptr;
+  {
+    std::lock_guard<std::mutex> lk(report_map_mutex);
+    const auto it = output_reports.find(report_id);
+    if (it == output_reports.end())
+      return false;
+    chr = it->second;
+  }
+  // without response when the device allows it: never wait on the radio
+  const bool response = !chr->canWriteNoResponse();
+  return chr->writeValue(data.data(), data.size(), response);
+}
+
+std::string ble_connected_name() {
+  std::lock_guard<std::mutex> lk(connected_name_mutex);
+  return connected_name;
 }

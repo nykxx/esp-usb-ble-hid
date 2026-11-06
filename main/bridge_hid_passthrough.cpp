@@ -1,0 +1,227 @@
+// Bridge mode: any BLE HID device (keyboard, mouse, ...) -> the same HID device
+// on USB. The USB report descriptor mirrors the device's Report Map, so every
+// input report is forwarded as is, with its report id (see hid_descriptor.hpp).
+#include "sdkconfig.h"
+#if CONFIG_BRIDGE_MODE_HID_PASSTHROUGH
+
+#include "bridge.hpp"
+
+#include <chrono>
+#include <condition_variable>
+#include <deque>
+#include <map>
+#include <mutex>
+#include <thread>
+#include <vector>
+
+#include "esp_system.h"
+
+#include "logger.hpp"
+#include "task.hpp"
+
+#include "hid_descriptor.hpp"
+#include "status_led.hpp"
+
+using namespace std::chrono_literals;
+
+static espp::Logger logger({.tag = "HID Passthrough", .level = espp::Logger::Verbosity::INFO});
+
+// whether the USB descriptor (the mirrored Report Map) declares report ids;
+// without them reports go out with id 0 (no id byte on the wire)
+static bool uses_report_ids = true;
+
+// Restarts in a row allowed to switch the USB descriptor to a newly paired
+// device's Report Map (guards against a device returning a varying map).
+static constexpr uint32_t kMaxDescriptorRestarts = 2;
+
+static uint8_t usb_report_id(uint8_t ble_report_id) { return uses_report_ids ? ble_report_id : 0; }
+
+/********* BLE -> USB: input reports ***************/
+
+// BLE notifications arrive on the NimBLE host task; they are queued and sent
+// from one sender task, in order (a key press must never overtake its
+// release), waiting for the interrupt IN endpoint to drain between reports.
+struct InReport {
+  uint8_t id{0};
+  std::vector<uint8_t> data;
+};
+static std::deque<InReport> hid_tx_queue;
+static std::mutex hid_tx_mutex;
+static std::condition_variable hid_tx_cv;
+static std::unique_ptr<espp::Task> hid_sender_task;
+static constexpr size_t kMaxQueuedReports = 64;
+static constexpr auto kSendTimeout = 50ms; // give up on one report after this
+
+static bool hid_sender_fn(std::mutex &, std::condition_variable &) {
+  InReport rep;
+  {
+    std::unique_lock<std::mutex> lock(hid_tx_mutex);
+    hid_tx_cv.wait_for(lock, 100ms, [] { return !hid_tx_queue.empty(); });
+    if (hid_tx_queue.empty())
+      return false;
+    rep = std::move(hid_tx_queue.front());
+    hid_tx_queue.pop_front();
+  }
+  if (!usb_is_mounted())
+    return false; // nobody to send to
+  const auto deadline = std::chrono::steady_clock::now() + kSendTimeout;
+  std::error_code ec;
+  while (!usb_write_hid_report(rep.id, rep.data, ec)) {
+    if (ec != std::errc::resource_unavailable_try_again ||
+        std::chrono::steady_clock::now() >= deadline) {
+      logger.warn_rate_limited("dropped HID report id {} ({})", rep.id, ec.message());
+      return false;
+    }
+    std::this_thread::sleep_for(1ms);
+  }
+  return false; // don't stop the task
+}
+
+static void enqueue_hid(uint8_t report_id, std::span<const uint8_t> report) {
+  if (!usb_is_mounted())
+    return;
+  {
+    std::lock_guard<std::mutex> lock(hid_tx_mutex);
+    if (hid_tx_queue.size() >= kMaxQueuedReports) {
+      logger.warn_rate_limited("HID queue full; dropping report id {}", report_id);
+      return;
+    }
+    hid_tx_queue.push_back({report_id, std::vector<uint8_t>(report.begin(), report.end())});
+  }
+  hid_tx_cv.notify_one();
+}
+
+// Length of the last report forwarded per report id, so every report can be
+// neutralized (all keys / buttons released) when the device goes away.
+static std::mutex sent_lengths_mutex;
+static std::map<uint8_t, size_t> sent_lengths;
+
+/********* USB -> BLE: output reports (keyboard LEDs) ***************/
+
+// Received on the TinyUSB task, written to the device from this worker. Only
+// the latest value per report id matters (LED state), so newer ones replace
+// pending ones.
+static std::mutex output_mutex;
+static std::condition_variable output_cv;
+static std::map<uint8_t, std::vector<uint8_t>> pending_output;
+static std::unique_ptr<espp::Task> output_task;
+
+static bool output_task_fn(std::mutex &, std::condition_variable &) {
+  std::map<uint8_t, std::vector<uint8_t>> todo;
+  {
+    std::unique_lock<std::mutex> lk(output_mutex);
+    output_cv.wait_for(lk, 100ms, [] { return !pending_output.empty(); });
+    todo.swap(pending_output);
+  }
+  for (const auto &[id, data] : todo)
+    ble_write_output_report(id, data);
+  return false; // don't stop the task
+}
+
+/********* Report Map -> USB descriptor ***************/
+
+// The device's Report Map arrived (BLE scan-timer task): enumerate with it.
+static void on_report_map(const std::vector<uint8_t> &map) {
+  if (map.empty()) {
+    logger.warn("device has no readable Report Map; keeping the current USB descriptor");
+    return;
+  }
+  if (!hid_descriptor_store(map)) {
+    hid_descriptor_reset_restart_count(); // USB already matches the device
+    return;
+  }
+  if (hid_descriptor_restart_count() >= kMaxDescriptorRestarts) {
+    logger.error("Report Map changed again after {} restarts; not restarting",
+                 hid_descriptor_restart_count());
+    return;
+  }
+  hid_descriptor_note_restart();
+  logger.info("new Report Map: restarting to enumerate with it");
+  std::this_thread::sleep_for(200ms); // let the log line out
+  esp_restart();
+}
+
+/********* bridge.hpp ***************/
+
+void bridge_init() {
+  ble_set_report_map_callback(on_report_map);
+
+  hid_sender_task = espp::Task::make_unique(
+      {.callback = hid_sender_fn,
+       .task_config = {.name = "usb_hid_tx", .stack_size_bytes = 4096, .priority = 10}});
+  hid_sender_task->start();
+  output_task = espp::Task::make_unique(
+      {.callback = output_task_fn, .task_config = {.name = "hid_out", .stack_size_bytes = 4096}});
+  output_task->start();
+}
+
+UsbHidConfig bridge_usb_config() {
+  UsbHidConfig cfg;
+  cfg.vid = CONFIG_DONGLE_USB_VID;
+  cfg.pid = CONFIG_DONGLE_USB_PID;
+  cfg.manufacturer = CONFIG_DONGLE_USB_MANUFACTURER;
+  cfg.product = CONFIG_DONGLE_USB_PRODUCT;
+
+  // the descriptor of the last paired device (or a plain keyboard)
+  cfg.hid.interface_name = "BLE HID Passthrough";
+  cfg.hid.report_descriptor = hid_descriptor_load();
+  uses_report_ids = hid_descriptor_uses_report_ids(cfg.hid.report_descriptor);
+  cfg.hid.has_out_endpoint = true; // keyboard LED output reports
+  cfg.hid.poll_interval_ms = 1;    // full-speed minimum: lowest added latency
+  cfg.hid.on_receive = [](std::span<const uint8_t> data) {
+    // TinyUSB task context: hand it over to the output worker (don't block)
+    if (data.empty())
+      return;
+    uint8_t id = 0;
+    if (uses_report_ids) {
+      id = data[0];
+      data = data.subspan(1);
+    }
+    {
+      std::lock_guard<std::mutex> lk(output_mutex);
+      pending_output[id].assign(data.begin(), data.end());
+    }
+    output_cv.notify_one();
+  };
+  cfg.on_unmount = []() {
+    std::lock_guard<std::mutex> lock(hid_tx_mutex);
+    hid_tx_queue.clear();
+  };
+  return cfg;
+}
+
+void bridge_on_ble_report(NimBLERemoteCharacteristic *chr, const uint8_t *data, size_t length) {
+  // its report id comes from the characteristic's Report Reference
+  const uint8_t id = usb_report_id(ble_report_id_for(chr).value_or(1));
+  {
+    std::lock_guard<std::mutex> lk(sent_lengths_mutex);
+    sent_lengths[id] = length;
+  }
+  enqueue_hid(id, std::span<const uint8_t>(data, length));
+}
+
+void bridge_on_ble_battery(uint8_t) {
+  // nothing to forward: the battery level is shown by the console
+}
+
+void bridge_on_ble_disconnect() {
+  // send an all-zero report for every report id seen, so no key or button
+  // stays pressed on the host when the device goes away mid-press
+  std::map<uint8_t, size_t> lengths;
+  {
+    std::lock_guard<std::mutex> lk(sent_lengths_mutex);
+    lengths.swap(sent_lengths);
+  }
+  for (const auto &[id, len] : lengths) {
+    const std::vector<uint8_t> zeros(len, 0);
+    enqueue_hid(id, zeros);
+  }
+}
+
+bool bridge_hid_ready() { return usb_is_mounted(); }
+
+void bridge_poll() {}
+
+std::string bridge_device_label() { return ble_connected_name(); }
+
+#endif // CONFIG_BRIDGE_MODE_HID_PASSTHROUGH

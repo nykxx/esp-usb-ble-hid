@@ -29,7 +29,42 @@ menu "Bridge Configuration"
                 Pairs with an Xbox (BLE) controller and presents a wired
                 Nintendo Switch Pro controller on USB.
 
+        config BRIDGE_MODE_HID_PASSTHROUGH
+            bool "BLE HID device -> USB HID device (passthrough)"
+            help
+                Pairs with any BLE HID device (keyboard, mouse, ...) and
+                presents the same HID device on USB: its Report Map is used as
+                the USB report descriptor and every input report is forwarded
+                as is. The Report Map is cached in NVS; when a newly paired
+                device's map differs, the dongle restarts once to enumerate
+                with it.
+
     endchoice
+
+    if BRIDGE_MODE_HID_PASSTHROUGH
+        config DONGLE_USB_VID
+            hex "USB vendor id"
+            default 0x1209
+            help
+                USB vendor id of the dongle. The default (pid.codes) is meant
+                for development only; use an id you are allowed to use before
+                distributing devices.
+
+        config DONGLE_USB_PID
+            hex "USB product id"
+            default 0x0001
+            help
+                USB product id of the dongle (the pid.codes test PID by
+                default).
+
+        config DONGLE_USB_MANUFACTURER
+            string "USB manufacturer string"
+            default "esp-usb-ble-hid"
+
+        config DONGLE_USB_PRODUCT
+            string "USB product string"
+            default "BLE HID Passthrough"
+    endif
 endmenu
 
 menu "USB Configuration"

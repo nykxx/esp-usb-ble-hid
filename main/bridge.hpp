@@ -4,7 +4,9 @@
 // it presents on USB. Exactly one implementation is built, selected in
 // menuconfig (Bridge Configuration -> Bridge mode):
 //  - bridge_switch_pro.cpp: an Xbox controller presented as a Switch Pro
-//    controller (the default).
+//    controller (the default),
+//  - bridge_hid_passthrough.cpp: any BLE keyboard / mouse presented as the
+//    same HID device on USB (reports forwarded as is).
 //
 // main.cpp owns the board, the services, BLE and USB bring-up, and routes
 // their events here.
