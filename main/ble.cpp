@@ -1,5 +1,6 @@
 #include <algorithm>
 #include <atomic>
+#include <cassert>
 #include <chrono>
 #include <cstdint>
 #include <mutex>
@@ -22,6 +23,7 @@ static std::unique_ptr<espp::Timer> scanTimer;
 // read from other tasks (the USB RX worker's status queries), written by the
 // BLE callbacks / scan timer: keep them atomic
 static std::atomic<bool> subscribed{false};
+static std::atomic<uint32_t> link_generation{0};
 // the link is encrypted (bonded / re-bonded); protected HID characteristics are
 // only discoverable + subscribable after this
 static std::atomic<bool> authenticated{false};
@@ -35,6 +37,36 @@ static std::atomic<int64_t> connect_started_us{0};
 // a pairing scan (accept any controller) stays in effect until this time; after
 // that a rescan goes back to reconnecting bonded controllers only
 static std::atomic<int64_t> pairing_until_us{0};
+
+// USB/button handlers only request changes. The supervisor tears down the old
+// link before scanning again, including an asynchronous connect in progress.
+static std::mutex selection_mutex;
+static ble_control::Selection selection;
+static save_selection_t save_selection;
+static std::atomic<bool> command_pending{false};
+static bool requested_pairing{false};
+static bool restart_selection_window{true};
+static std::atomic<bool> reconnect_preference{false};
+// Reuse one client without self-deletion: disconnect callbacks must not free
+// it while the supervisor is discovering characteristics or changing peers.
+static NimBLEClient *ble_client{nullptr};
+static std::mutex input_mutex;
+static std::mutex client_data_mutex;
+static std::optional<NimBLEAddress> scan_candidate; // protected by selection_mutex
+
+static ble_control::Peer peer_identity(const NimBLEAddress &address) {
+  ble_control::Peer peer;
+  std::copy(address.getVal(), address.getVal() + peer.address.size(), peer.address.begin());
+  peer.type = address.getType() & 1; // public/random identity variants use the same key
+  return peer;
+}
+
+// selection_mutex held by caller.
+static void request_link_change(bool pairing, bool restart_window = true) {
+  requested_pairing = pairing;
+  restart_selection_window = restart_window;
+  command_pending = true;
+}
 
 // link diagnostics, exposed to the console (a "connected but no inputs" report
 // is much easier to chase when it says whether notifications are arriving and
@@ -148,7 +180,9 @@ static std::string read_controller_name(NimBLEClient *client) {
 // (disconnect callback) and from the scan timer (missed disconnect); the app is
 // told through the disconnect callback so it can neutralize its inputs.
 static void reset_link_state(const std::string &why) {
+  std::lock_guard<std::mutex> input_lock(input_mutex);
   const bool was_subscribed = subscribed.exchange(false);
+  link_generation.fetch_add(1);
   authenticated = false;
   subscribe_attempts = 0;
   {
@@ -164,6 +198,7 @@ static void reset_link_state(const std::string &why) {
   }
   set_link_detail(why);
   if (was_subscribed) {
+    reconnect_preference = true;
     ble_logger.info("controller link down ({}); {} notifications received", why,
                     notification_count.load());
     if (disconnect_callback)
@@ -176,6 +211,11 @@ static void reset_link_state(const std::string &why) {
 // keep the "controller is sending inputs" diagnostics fresh), then hand it to
 // the app.
 static void on_notify(NimBLERemoteCharacteristic *chr, uint8_t *data, size_t len, bool is_notify) {
+  std::lock_guard<std::mutex> input_lock(input_mutex);
+  // Battery subscriptions may deliver their initial value during discovery.
+  // Only HID input must wait until the USB descriptor has been validated.
+  if (command_pending || (!subscribed && chr->getUUID() != battery_level_uuid))
+    return;
   bool is_input_report = false;
   {
     std::lock_guard<std::mutex> lk(report_map_mutex);
@@ -332,6 +372,10 @@ class ScanCallbacks : public NimBLEScanCallbacks {
   espp::Logger logger =
       espp::Logger({.tag = "BLE Scan Callbacks", .level = espp::Logger::Verbosity::INFO});
   void onResult(const NimBLEAdvertisedDevice *advertisedDevice) override {
+    std::lock_guard<std::mutex> lock(selection_mutex);
+    if (command_pending || connect_pending ||
+        ble_client->getConnHandle() != BLE_HS_CONN_HANDLE_NONE)
+      return;
     logger.info("Advertised Device found: {}", advertisedDevice->toString());
     bool should_connect = false;
     bool is_pairable_device =
@@ -341,7 +385,8 @@ class ScanCallbacks : public NimBLEScanCallbacks {
       // if we're pairing, then simply connect to the first device that advertises
       // the HID service. The connection callback will try to bond to it.
       should_connect = true;
-    } else if (!is_pairing && NimBLEDevice::isBonded(advertisedDevice->getAddress())) {
+    } else if (!is_pairing && NimBLEDevice::isBonded(advertisedDevice->getAddress()) &&
+               selection.accepts(peer_identity(advertisedDevice->getAddress()))) {
       // if we're not pairing, then we're reconnecting, so we need to check if
       // the device is bonded
       should_connect = true;
@@ -367,30 +412,10 @@ class ScanCallbacks : public NimBLEScanCallbacks {
       advertised_appearance =
           advertisedDevice->haveAppearance() ? advertisedDevice->getAppearance() : 0;
 
-      /** Async connections can be made directly in the scan callbacks */
-      auto pClient = NimBLEDevice::getDisconnectedClient();
-      if (!pClient) {
-        pClient = NimBLEDevice::createClient(advertisedDevice->getAddress());
-        if (!pClient) {
-          logger.error("Failed to create client");
-          set_link_detail("could not create a BLE client");
-          connect_pending = false;
-          return;
-        }
-      }
-
-      // and set our callbacks
-      pClient->setClientCallbacks(&clientCallbacks, false);
-      static constexpr bool delete_on_disconnect = true;
-      static constexpr bool delete_on_connect_fail = true;
-      pClient->setSelfDelete(delete_on_disconnect, delete_on_connect_fail);
-      if (!pClient->connect(true, true,
-                            false)) { // delete attributes, async connect, no MTU exchange
-        logger.error("Failed to connect");
-        set_link_detail("could not start the connection attempt");
-        connect_pending = false;
-        return;
-      }
+      // Copy the address: the scan result will be invalidated by the next scan.
+      // The supervisor connects, so attribute deletion cannot race a GATT read
+      // by the main task, and the BLE host task never waits on that read.
+      scan_candidate = advertisedDevice->getAddress();
     }
   }
 
@@ -402,6 +427,7 @@ class ScanCallbacks : public NimBLEScanCallbacks {
 };
 
 std::string get_connected_client_serial_number() {
+  std::lock_guard<std::mutex> lock(client_data_mutex);
   auto clients = NimBLEDevice::getConnectedClients();
   if (clients.size() == 0) {
     return "";
@@ -542,7 +568,76 @@ static void ensure_scanning(int64_t now) {
 // bring-up is driven from one place regardless of which BLE callback did (or
 // did not) fire.
 static bool timer_callback() {
+  std::lock_guard<std::mutex> client_lock(client_data_mutex);
   const int64_t now = esp_timer_get_time();
+  {
+    std::lock_guard<std::mutex> lock(selection_mutex);
+    if (!command_pending && reconnect_preference.exchange(false))
+      selection.restart(now);
+    if (!command_pending && !subscribed && !is_pairing && selection.expire(now)) {
+      request_link_change(false, false);
+      set_link_detail("selected peer unavailable; reconnecting to any paired device");
+    }
+  }
+  if (command_pending) {
+    NimBLEDevice::getScan()->stop();
+    {
+      std::lock_guard<std::mutex> lock(selection_mutex);
+      if (scan_candidate) {
+        scan_candidate.reset();
+        connect_pending = false; // it had not reached NimBLE yet
+      }
+    }
+    reset_link_state("changing BLE connection");
+    // isConnected() becomes false as soon as disconnect() is requested.
+    // The handle is cleared only after NimBLE finishes its disconnect event.
+    if (ble_client->getConnHandle() != BLE_HS_CONN_HANDLE_NONE) {
+      if (ble_client->isConnected())
+        ble_client->disconnect();
+      return false; // wait for the disconnect event before accepting another peer
+    }
+    if (connect_pending) {
+      ble_client->cancelConnect();
+      if (now - connect_started_us.load() >= kConnectTimeoutUs && !ble_gap_conn_active())
+        connect_pending = false; // recover if a completed cancellation lost its callback
+      return false;              // onConnectFail / onConnect will finish the outstanding attempt
+    }
+    bool pairing;
+    {
+      std::lock_guard<std::mutex> lock(selection_mutex);
+      pairing = requested_pairing || NimBLEDevice::getNumBonds() == 0;
+      reconnect_preference = false;
+      if (pairing)
+        selection.allow_any();
+      else if (restart_selection_window)
+        selection.restart(now);
+      pairing_until_us = requested_pairing ? now + kPairingWindowUs : 0;
+      set_link_detail(pairing               ? "pairing; looking for a HID device"
+                      : selection.waiting() ? "looking for the preferred device (10 s)"
+                                            : "automatically reconnecting to any paired device");
+      command_pending = false;
+    }
+    start_scan(pairing);
+    return false;
+  }
+  {
+    std::lock_guard<std::mutex> lock(selection_mutex);
+    if (command_pending)
+      return false;
+    if (scan_candidate) {
+      const auto address = *scan_candidate;
+      scan_candidate.reset();
+      connect_started_us = now;
+      // Explicitly replace the previous peer when reusing the client.
+      if (!ble_client->connect(address, true, true, false)) {
+        connect_pending = false;
+        set_link_detail("could not start the connection attempt");
+      }
+      return false;
+    }
+  }
+  if (ble_client->getConnHandle() != BLE_HS_CONN_HANDLE_NONE && !ble_client->isConnected())
+    return false; // an automatic disconnect is still completing
   auto pClients = NimBLEDevice::getConnectedClients();
 
   if (pClients.empty()) {
@@ -646,12 +741,6 @@ static bool timer_callback() {
     set_link_detail(fmt::format("{} (attempt {}/{})", why, attempt, kMaxSubscribeAttempts));
     return false;
   }
-  notification_count = 0;
-  last_notify_us = -1;
-  subscribed = true;
-  link_state = BleLinkState::Subscribed;
-  set_link_detail(fmt::format("subscribed on attempt {}", attempt));
-
   // we were able to get the HID service and subscribe, so also subscribe
   // to the battery service if it exists.
   if (auto *pBatterySvc = pClient->getService(battery_service_uuid)) {
@@ -699,15 +788,44 @@ static bool timer_callback() {
     std::lock_guard<std::mutex> lk(connected_name_mutex);
     connected_info = info;
   }
-  // and hand the Report Map to the app (it mirrors it on USB)
+  // Commit the peer and descriptor together. A newly selected peer must not
+  // overtake the old peer's descriptor callback and reboot with the wrong map.
+  std::lock_guard<std::mutex> selection_lock(selection_mutex);
+  if (command_pending || !pClient->isConnected() || !authenticated)
+    return false;
+  if (is_pairing) {
+    const auto peer = peer_identity(pClient->getConnInfo().getIdAddress());
+    std::string error;
+    if (selection.preferred != peer && save_selection && !save_selection(peer, error)) {
+      set_link_detail("could not save the paired device: " + error);
+      return false;
+    }
+    selection.preferred = peer; // persisted before a descriptor-triggered reboot
+  }
   if (report_map_callback) {
     std::vector<uint8_t> map;
     {
       std::lock_guard<std::mutex> lk(report_map_mutex);
       map = remote_report_map;
     }
-    report_map_callback(map);
+    if (!report_map_callback(map)) {
+      set_link_detail("USB descriptor is not ready for this device; retrying");
+      return false;
+    }
   }
+  {
+    std::lock_guard<std::mutex> input_lock(input_mutex);
+    if (!pClient->isConnected() || !authenticated)
+      return false;
+    notification_count = 0;
+    last_notify_us = -1;
+    subscribed = true;
+  }
+  selection.allow_any();
+  pairing_until_us = 0;
+  is_pairing = false;
+  link_state = BleLinkState::Subscribed;
+  set_link_detail(fmt::format("subscribed on attempt {}", attempt));
   return false; // don't stop the timer
 }
 
@@ -727,10 +845,14 @@ void init_ble(const std::string &device_name) {
   bool mitm = false;
   bool secure_connections = true;
   NimBLEDevice::setSecurityAuth(bonding, mitm, secure_connections);
+  ble_client = NimBLEDevice::createClient();
+  assert(ble_client);
+  ble_client->setClientCallbacks(&clientCallbacks, false);
+  ble_client->setSelfDelete(false, false);
 }
 
-// Start (or restart) the scan. Called from the main task at boot, from the
-// console's actions, and from the scan timer; the LED is handled by the timer.
+// Start (or restart) the scan. Only the supervisor calls this; external
+// commands request a link change and wait for the previous link to finish.
 static void start_scan(bool pairing) {
   is_pairing = pairing;
   breathing_period = pairing ? pairing_breathing_period : reconnecting_breathing_period;
@@ -761,7 +883,11 @@ static void start_scan(bool pairing) {
     ble_logger.error("could not start the {} scan", pairing ? "pairing" : "reconnection");
     set_link_detail("scan could not be started; retrying");
   }
+}
 
+static void start_supervisor() {
+  static std::mutex start_mutex;
+  std::lock_guard<std::mutex> lock(start_mutex);
   if (!scanTimer) {
     // the link supervisor: (re)scans when nothing is connected, drives the
     // encryption + HID subscription of a connected controller, owns the LED
@@ -777,18 +903,28 @@ static void start_scan(bool pairing) {
 
 void start_ble_reconnection_thread(notify_callback_t callback) {
   // save the callback
-  notify_callback = callback;
-  pairing_until_us = 0;
-  // if there are no bonded devices, there is nothing to reconnect to: pair instead
-  start_scan(NimBLEDevice::getNumBonds() == 0);
+  {
+    std::lock_guard<std::mutex> input_lock(input_mutex);
+    notify_callback = callback;
+  }
+  {
+    std::lock_guard<std::mutex> lock(selection_mutex);
+    request_link_change(false);
+  }
+  start_supervisor();
 }
 
 void start_ble_pairing_thread(notify_callback_t callback) {
   // save the callback
-  notify_callback = callback;
-  // accept new controllers for a while (the scan itself cycles every 5 s)
-  pairing_until_us = esp_timer_get_time() + kPairingWindowUs;
-  start_scan(true);
+  {
+    std::lock_guard<std::mutex> input_lock(input_mutex);
+    notify_callback = callback;
+  }
+  {
+    std::lock_guard<std::mutex> lock(selection_mutex);
+    request_link_change(true);
+  }
+  start_supervisor();
 }
 
 bool is_ble_subscribed() { return subscribed.load(); }
@@ -846,16 +982,92 @@ static std::vector<NimBLEAddress> connected_identity_addresses() {
 std::vector<BleBond> ble_bonds() {
   std::vector<BleBond> bonds;
   const auto connected = connected_identity_addresses();
+  std::optional<ble_control::Peer> preferred;
+  {
+    std::lock_guard<std::mutex> lock(selection_mutex);
+    preferred = selection.preferred;
+  }
   const int count = NimBLEDevice::getNumBonds();
   for (int i = 0; i < count; ++i) {
     const NimBLEAddress addr = NimBLEDevice::getBondedAddress(i);
     BleBond b;
     std::copy(addr.getVal(), addr.getVal() + b.address.size(), b.address.begin());
-    b.address_type = addr.getType();
+    b.address_type = addr.getType() & 1;
     b.connected = std::find(connected.begin(), connected.end(), addr) != connected.end();
+    b.selected = preferred == peer_identity(addr);
     bonds.push_back(b);
   }
+  std::sort(bonds.begin(), bonds.end(), [](const BleBond &a, const BleBond &b) {
+    return ble_control::Selection::less({a.address, a.address_type}, {b.address, b.address_type});
+  });
   return bonds;
+}
+
+void ble_configure_selection(std::optional<ble_control::Peer> peer, save_selection_t save) {
+  std::lock_guard<std::mutex> lock(selection_mutex);
+  save_selection = std::move(save);
+  if (peer && !NimBLEDevice::isBonded(NimBLEAddress(peer->address.data(), peer->type))) {
+    peer.reset();
+    std::string error;
+    if (save_selection && !save_selection(peer, error))
+      ble_logger.warn("Could not clear stale preference: {}", error);
+  }
+  selection.preferred = peer;
+}
+
+// selection_mutex held; persistence succeeds before the live choice changes.
+static bool select_peer(const ble_control::Peer &peer, std::string &error) {
+  if (selection.preferred != peer && save_selection && !save_selection(peer, error))
+    return false;
+  selection.preferred = peer;
+  if (!command_pending && subscribed && ble_client->isConnected() &&
+      peer_identity(ble_client->getConnInfo().getIdAddress()) == peer) {
+    selection.allow_any(); // a single registered peer does not need a reconnect
+    return true;
+  }
+  selection.restart(esp_timer_get_time()); // lets subsequent taps advance immediately
+  request_link_change(false);
+  return true;
+}
+
+bool ble_select_bond(const std::array<uint8_t, 6> &address, uint8_t type, std::string &error) {
+  std::lock_guard<std::mutex> lock(selection_mutex);
+  if (type > 1 || !NimBLEDevice::isBonded(NimBLEAddress(address.data(), type))) {
+    error = "no such paired device";
+    return false;
+  }
+  return select_peer({address, type}, error);
+}
+
+bool ble_select_next_bond(std::string &error) {
+  const auto bonds = ble_bonds();
+  std::vector<ble_control::Peer> peers;
+  std::optional<ble_control::Peer> connected;
+  for (const auto &bond : bonds) {
+    const ble_control::Peer peer{bond.address, bond.address_type};
+    peers.push_back(peer);
+    if (bond.connected)
+      connected = peer;
+  }
+  std::lock_guard<std::mutex> lock(selection_mutex);
+  const auto next = selection.next(peers, connected);
+  if (!next || !NimBLEDevice::isBonded(NimBLEAddress(next->address.data(), next->type))) {
+    error = "no paired device available";
+    return false;
+  }
+  return select_peer(*next, error);
+}
+
+static void forget_selection(std::optional<ble_control::Peer> peer) {
+  std::lock_guard<std::mutex> lock(selection_mutex);
+  if (!peer || selection.preferred == peer) {
+    selection.preferred.reset();
+    selection.allow_any();
+    std::string error;
+    if (save_selection && !save_selection(std::nullopt, error))
+      ble_logger.warn("Could not clear peer preference: {}", error);
+    request_link_change(false);
+  }
 }
 
 bool ble_forget_bond(const std::array<uint8_t, 6> &address, uint8_t address_type) {
@@ -870,7 +1082,10 @@ bool ble_forget_bond(const std::array<uint8_t, 6> &address, uint8_t address_type
       reset_link_state("bond forgotten");
     }
   }
-  return NimBLEDevice::deleteBond(addr);
+  if (!NimBLEDevice::deleteBond(addr))
+    return false;
+  forget_selection(peer_identity(addr));
+  return true;
 }
 
 bool ble_clear_bonds() {
@@ -879,15 +1094,23 @@ bool ble_clear_bonds() {
     client->disconnect();
   }
   reset_link_state("all bonds cleared");
-  return NimBLEDevice::deleteAllBonds();
+  if (!NimBLEDevice::deleteAllBonds())
+    return false;
+  forget_selection(std::nullopt);
+  return true;
 }
 
 void ble_set_report_map_callback(report_map_callback_t callback) {
   report_map_callback = std::move(callback); // set once at startup, before scanning
 }
 
-bool ble_write_output_report(uint8_t report_id, std::span<const uint8_t> data) {
-  if (!subscribed)
+uint32_t ble_link_generation() { return link_generation.load(); }
+
+bool ble_write_output_report(uint8_t report_id, std::span<const uint8_t> data,
+                             uint32_t generation) {
+  // The supervisor owns discovery / attribute deletion under this same lock.
+  std::lock_guard<std::mutex> client_lock(client_data_mutex);
+  if (!subscribed || command_pending || generation != link_generation.load())
     return false;
   NimBLERemoteCharacteristic *chr = nullptr;
   {
@@ -904,10 +1127,10 @@ bool ble_write_output_report(uint8_t report_id, std::span<const uint8_t> data) {
 
 std::string ble_connected_name() {
   std::lock_guard<std::mutex> lk(connected_name_mutex);
-  return connected_name;
+  return subscribed ? connected_name : std::string{};
 }
 
 BleDeviceInfo ble_connected_device_info() {
   std::lock_guard<std::mutex> lk(connected_name_mutex);
-  return connected_info;
+  return subscribed ? connected_info : BleDeviceInfo{};
 }

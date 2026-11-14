@@ -64,6 +64,7 @@ public:
     action_fn on_action{nullptr};
     bonds_fn bonds{nullptr};
     forget_bond_fn forget_bond{nullptr};
+    forget_bond_fn select_bond{nullptr};
     espp::Logger::Verbosity log_level{espp::Logger::Verbosity::WARN};
   };
 
@@ -75,6 +76,7 @@ public:
       , on_action_(config.on_action)
       , bonds_(config.bonds)
       , forget_bond_(config.forget_bond)
+      , select_bond_(config.select_bond)
       , settings_(config.initial) {}
 
   /// The dispatcher module id this module answers on.
@@ -177,6 +179,21 @@ public:
       send_bonds();
       break;
     }
+    case Msg::SelectBond: {
+      const auto target = device_config::parse_forget_bond_payload(frame.payload);
+      if (!target || target->second > 1) {
+        send_error(request, ErrorCode::Malformed, "SELECT_BOND requires [addr 6B][type 0 or 1]");
+        break;
+      }
+      std::string error;
+      if (!select_bond_ || !select_bond_(target->first, target->second, error)) {
+        send_error(request, ErrorCode::Failed, error.empty() ? "selection failed" : error);
+        break;
+      }
+      send(Msg::Ok, device_config::make_ok_payload(request));
+      send_bonds();
+      break;
+    }
     default:
       send_error(request, ErrorCode::UnknownRequest, "unknown request");
       break;
@@ -221,6 +238,7 @@ protected:
   action_fn on_action_;
   bonds_fn bonds_;
   forget_bond_fn forget_bond_;
+  forget_bond_fn select_bond_;
 
   mutable std::mutex mutex_;
   Settings settings_;

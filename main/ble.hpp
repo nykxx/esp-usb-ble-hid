@@ -12,6 +12,7 @@
 
 #include "battery_service.hpp"
 #include "ble_appearances.hpp"
+#include "connection_selection.hpp"
 #include "device_info_service.hpp"
 #include "generic_access_service.hpp"
 #include "hid_service.hpp"
@@ -34,9 +35,17 @@ struct BleBond {
   std::array<uint8_t, 6> address{}; ///< identity address bytes (NimBLE order)
   uint8_t address_type{0};          ///< BLE address type
   bool connected{false};            ///< currently connected
+  bool selected{false};             ///< saved preferred peer
 };
 /// The bonded (paired) controllers.
 std::vector<BleBond> ble_bonds();
+using save_selection_t =
+    std::function<bool(const std::optional<ble_control::Peer> &, std::string &)>;
+/// Configure before starting scans. The preference gets a 10-second head start
+/// at boot and after disconnection, then automatic reconnection accepts any bond.
+void ble_configure_selection(std::optional<ble_control::Peer> peer, save_selection_t save);
+bool ble_select_bond(const std::array<uint8_t, 6> &address, uint8_t type, std::string &error);
+bool ble_select_next_bond(std::string &error);
 /// Called (from the BLE host task or the scan timer) when the controller link
 /// goes down after it had been subscribed -- the app must neutralize the
 /// inputs it forwards, since no further notifications will arrive.
@@ -76,14 +85,16 @@ bool ble_forget_bond(const std::array<uint8_t, 6> &address, uint8_t address_type
 /// the bond store could not be cleared (bonds may remain).
 bool ble_clear_bonds();
 std::string get_connected_client_serial_number();
-/// Called (from the BLE scan-timer task) once a device is subscribed, with its
-/// HID Report Map (empty if it could not be read).
-using report_map_callback_t = std::function<void(const std::vector<uint8_t> &report_map)>;
+/// Called before forwarding any input, on the BLE supervisor. Return true only
+/// when USB can interpret this Report Map. Must not call BLE selection APIs.
+using report_map_callback_t = std::function<bool(const std::vector<uint8_t> &report_map)>;
 void ble_set_report_map_callback(report_map_callback_t callback);
 /// Write a host -> device output report (e.g. keyboard LEDs) to the subscribed
 /// device. `data` excludes the report id. Returns false if there is no such
 /// output report. May block briefly: do not call from the TinyUSB task.
-bool ble_write_output_report(uint8_t report_id, std::span<const uint8_t> data);
+bool ble_write_output_report(uint8_t report_id, std::span<const uint8_t> data, uint32_t generation);
+/// Token for queued output: invalidated on disconnect / connection switching.
+uint32_t ble_link_generation();
 /// Name of the subscribed device ("" if none or unknown).
 std::string ble_connected_name();
 /// What the subscribed device says about itself: its advertised GAP Appearance

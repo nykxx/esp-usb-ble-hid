@@ -18,7 +18,8 @@ Hosted copy: <https://finger563.github.io/esp-usb-ble-hid/dongle_console.html>
   against GitHub Releases (see the Firmware tab below); everything else works
   offline.
 - Click **Connect dongle** and pick the device. The dongle enumerates as a
-  *Nintendo Switch Pro Controller* (VID `057E`, PID `2009`); **Pick any USB
+  *Nintendo Switch Pro Controller* (VID `057E`, PID `2009`) or
+  *BLE HID Passthrough* (VID `1209`, PID `0001`); **Pick any USB
   device…** lists every device if you are on a modified build.
 - On Linux you may need a udev rule granting your user access to `057e:2009`.
 
@@ -150,6 +151,27 @@ The panel at the bottom shows timestamped, colour-coded messages. **Log frames
 truncated). **Clear log** empties it.
 
 ## Testing the protocol code
+
+Run `node web/test/bond_selection_test.cjs` from the repository root to check
+the bond-selection codec, old-firmware compatibility and inline-script syntax.
+After `idf.py reconfigure` or `idf.py build` fetches the dependencies,
+`bash tests/run_host_tests.sh` also runs the C++ button/selection, payload and
+DeviceConfig module tests with the host compiler (C++20) and Node.js.
+
+The paired-device list has a **Connect** button on firmware supporting
+`SELECT_BOND` (`0x08`). It saves the preferred peer and queues a connection
+change; **connected** appears only when the actual link is up. The preferred
+peer gets a 10-second exclusive search before automatic fallback to any bond.
+The dongle's short press cycles in the same address order as this list;
+holding it for 3 seconds starts pairing without cycling on release.
+In HID passthrough mode a different Report Map requires one firmware restart;
+the preference is saved first and the console reconnects with **Auto-connect**
+enabled. Reports are not forwarded until their layout matches the USB descriptor.
+
+`SELECT_BOND` uses `[identity address 6B][address type u8]` and replies with
+`OK`, then `BONDS`. New firmware appends one byte to `BONDS`: the selected
+entry's one-based index, or zero for none. Old readers ignore this trailer;
+the new console hides **Connect** when talking to firmware without it.
 
 The first `<script id="proto">` block is DOM-free and exports its functions
 when loaded under node (`module.exports`), so the frame codec, discovery (v1

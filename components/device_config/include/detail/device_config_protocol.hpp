@@ -21,11 +21,13 @@
 //   0x05 ACTION        [action u8]       0x85 BONDS     (see serialize_bonds)
 //   0x06 GET_BONDS     (no payload)
 //   0x07 FORGET_BOND   [addr 6B][type u8]
+//   0x08 SELECT_BOND   [addr 6B][type u8]
 //
 // SET_SETTINGS carries the same TLV list as SETTINGS and may be *partial*: only
 // the keys present are changed. On success the device replies OK and then a
 // full SETTINGS so the host always ends with the authoritative values.
-// FORGET_BOND replies OK and then a fresh BONDS list.
+// FORGET_BOND / SELECT_BOND reply OK and then a fresh BONDS list. SELECT_BOND
+// acknowledges a queued connection change; INFO reports its progress.
 //
 // Versioning: INFO / SETTINGS / BONDS payloads start with kProtocolVersion.
 // Within a version, payloads only ever grow compatibly (new TLV keys, which
@@ -62,6 +64,7 @@ enum class Msg : uint8_t {
   Action = 0x05,
   GetBonds = 0x06,
   ForgetBond = 0x07,
+  SelectBond = 0x08, ///< OK acknowledges the request; connection completes asynchronously
   // replies (request | 0x80)
   Info = 0x81,
   Settings = 0x82,
@@ -430,6 +433,7 @@ struct BondInfo {
   bool connected{false};   ///< this controller is the one currently connected
   std::string label;       ///< the controller's name as it reported it (GAP Device Name or
                            ///< advertised name) when it last connected; "" = unknown
+  bool selected{false};    ///< preferred peer, which may differ from the live connection
 
   bool operator==(const BondInfo &) const = default;
 
@@ -450,6 +454,8 @@ struct BondInfo {
 static constexpr size_t kBondAddressSize = 6;
 
 /// BONDS payload: [version u8][count u8] then count x [addr 6B][type u8][connected u8][label str]
+/// Optional trailer: [selected index + 1 u8], 0 for no preference. Old readers
+/// ignore it; its presence advertises SELECT_BOND support to the web console.
 inline std::vector<uint8_t> serialize_bonds(const std::vector<BondInfo> &bonds) {
   std::vector<uint8_t> out;
   put_u8(out, kProtocolVersion);
@@ -463,6 +469,14 @@ inline std::vector<uint8_t> serialize_bonds(const std::vector<BondInfo> &bonds) 
     put_u8(out, b.connected ? 1 : 0);
     put_str(out, b.label);
   }
+  uint8_t selected = 0;
+  for (size_t i = 0; i < std::min<size_t>(bonds.size(), 255); ++i) {
+    if (bonds[i].selected) {
+      selected = static_cast<uint8_t>(i + 1);
+      break;
+    }
+  }
+  put_u8(out, selected);
   return out;
 }
 
@@ -487,10 +501,16 @@ inline std::optional<std::vector<BondInfo>> parse_bonds(std::span<const uint8_t>
     b.label = std::move(*label);
     bonds.push_back(std::move(b));
   }
+  if (const auto selected = r.u8()) {
+    if (*selected > bonds.size())
+      return std::nullopt;
+    if (*selected)
+      bonds[*selected - 1].selected = true;
+  }
   return bonds;
 }
 
-/// FORGET_BOND payload: [addr 6B][type u8]
+/// FORGET_BOND and SELECT_BOND payload: [addr 6B][type u8]
 inline std::vector<uint8_t> make_forget_bond_payload(const std::array<uint8_t, 6> &address,
                                                      uint8_t address_type) {
   std::vector<uint8_t> out(address.begin(), address.end());

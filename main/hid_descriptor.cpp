@@ -99,6 +99,12 @@ bool hid_descriptor_is_cached() {
   return cached;
 }
 
+bool hid_descriptor_matches(std::span<const uint8_t> report_map) {
+  std::lock_guard<std::mutex> lk(mutex);
+  return !report_map.empty() &&
+         std::equal(report_map.begin(), report_map.end(), in_use.begin(), in_use.end());
+}
+
 bool hid_descriptor_store(std::span<const uint8_t> report_map) {
   if (report_map.empty() || report_map.size() > kMaxReportMap) {
     logger.warn("ignoring a Report Map of {} bytes", report_map.size());

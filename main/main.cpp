@@ -135,6 +135,7 @@ static std::vector<device_config::BondInfo> device_bonds() {
     info.address = b.address;
     info.address_type = b.address_type;
     info.connected = b.connected;
+    info.selected = b.selected;
     // the name the controller reported when it last connected ("" = unknown)
     info.label = services_bond_name(b.address);
     bonds.push_back(std::move(info));
@@ -213,31 +214,18 @@ extern "C" void app_main(void) {
                               .on_action = device_action,
                               .bonds = device_bonds,
                               .forget_bond = device_forget_bond,
+                              .select_bond = ble_select_bond,
                               .on_settings_changed = apply_settings});
   const auto settings = services_settings();
   apply_settings(settings);
   if (const auto report = services_crash_report(); !report.empty())
     logger.warn("Previous boot crashed:\n{}", report);
 
-  // MARK: BLE pairing timer (for use with button)
-  espp::HighResolutionTimer ble_pairing_timer{
-      {.name = "Pairing Timer", .callback = [&]() { start_ble_pairing_thread(notifyCB); }}};
-
-  // MARK: Pairing button initialization
-  logger.info("Initializing the button");
-  auto on_button_pressed = [&](const auto &event) {
-    if (event.active) {
-      // start ble pairing timer
-      ble_pairing_timer.oneshot(3'000'000); // 3 seconds
-    } else {
-      // cancel the ble pairing timer
-      ble_pairing_timer.stop();
-    }
-  };
-  bsp.initialize_button(on_button_pressed);
-
   // MARK: Bridge initialization (Bridge Configuration -> Bridge mode)
   bridge_init();
+  // Load the USB descriptor and boot-keyboard layout before BLE notifications
+  // can arrive. These remain fixed for this USB enumeration.
+  const auto usb_config = bridge_usb_config();
 
   // MARK: BLE initialization -- before USB: as soon as the device is mounted
   // the console can ask for status / bonds / actions, which use NimBLE.
@@ -256,13 +244,45 @@ extern "C" void app_main(void) {
     bridge_on_ble_disconnect();
   });
 
+  ble_configure_selection(services_preferred_peer(), services_save_preferred_peer);
+  start_ble_reconnection_thread(notifyCB);
+
+  // The BLE subsystem is ready before button or USB commands can arrive.
+  // Long hold fires at 3 s; releasing that hold must not also cycle peers.
+  ble_control::Button button;
+  std::mutex button_mutex;
+  auto button_action = [&](ble_control::Button::Action action) {
+    if (action == ble_control::Button::Action::Pair) {
+      start_ble_pairing_thread(notifyCB);
+    } else if (action == ble_control::Button::Action::Next) {
+      std::string error;
+      if (!ble_select_next_bond(error))
+        logger.info("Button: {}", error);
+    }
+  };
+  bsp.initialize_button([&](const auto &event) {
+    ble_control::Button::Action action;
+    {
+      std::lock_guard<std::mutex> lock(button_mutex);
+      action = button.edge(event.active, esp_timer_get_time());
+    }
+    button_action(action);
+  });
+  espp::Timer button_timer({.name = "Connection button", .period = 20ms, .callback = [&] {
+                              ble_control::Button::Action action;
+                              {
+                                std::lock_guard<std::mutex> lock(button_mutex);
+                                action = button.tick(esp_timer_get_time());
+                              }
+                              button_action(action);
+                              return false;
+                            }});
+
   // MARK: USB initialization
   logger.info("USB initialization");
-  if (!start_usb(bridge_usb_config())) {
+  if (!start_usb(usb_config)) {
     logger.error("USB initialization failed");
   }
-  logger.info("Scanning for peripherals");
-  start_ble_reconnection_thread(notifyCB);
 
   // Loop here until we find a device we want to connect to
   while (true) {

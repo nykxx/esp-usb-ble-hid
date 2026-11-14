@@ -103,6 +103,49 @@ static std::string bond_key(const std::array<uint8_t, 6> &address) {
                      address[3], address[4], address[5]);
 }
 
+std::optional<ble_control::Peer> services_preferred_peer() {
+  if (!nvs_storage)
+    return std::nullopt;
+  std::string value;
+  std::error_code ec;
+  nvs_storage->get_var(kNvsNamespace, "ble_peer", value, ec);
+  if (ec || value.size() != 13 || (value[12] != '0' && value[12] != '1'))
+    return std::nullopt;
+  auto digit = [](char c) -> int {
+    if (c >= '0' && c <= '9')
+      return c - '0';
+    if (c >= 'a' && c <= 'f')
+      return c - 'a' + 10;
+    return -1;
+  };
+  ble_control::Peer peer;
+  for (size_t i = 0; i < peer.address.size(); ++i) {
+    const int hi = digit(value[i * 2]), lo = digit(value[i * 2 + 1]);
+    if (hi < 0 || lo < 0)
+      return std::nullopt;
+    peer.address[i] = static_cast<uint8_t>((hi << 4) | lo);
+  }
+  peer.type = value[12] - '0';
+  return peer;
+}
+
+bool services_save_preferred_peer(const std::optional<ble_control::Peer> &peer,
+                                  std::string &error) {
+  if (!nvs_storage) {
+    error = "NVS is not initialized";
+    return false;
+  }
+  // NVS strings cannot hold embedded NULs; store address bytes as hex + type.
+  const auto value = peer ? bond_key(peer->address) + std::to_string(peer->type) : std::string{};
+  std::error_code ec;
+  nvs_storage->set_var(kNvsNamespace, "ble_peer", value, ec);
+  if (ec) {
+    error = "could not save selected peer: " + ec.message();
+    return false;
+  }
+  return true;
+}
+
 std::string services_bond_name(const std::array<uint8_t, 6> &address) {
   if (!nvs_storage)
     return {};
@@ -243,6 +286,7 @@ void services_init(espp::DispatcherWorker *link, const ServicesCallbacks &callba
       .on_action = callbacks.on_action,
       .bonds = callbacks.bonds,
       .forget_bond = callbacks.forget_bond,
+      .select_bond = callbacks.select_bond,
       .log_level = espp::Logger::Verbosity::INFO});
   if (!link)
     return; // the module still holds + serves the settings for the app

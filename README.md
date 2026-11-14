@@ -74,6 +74,7 @@ https://github.com/user-attachments/assets/c81b947a-24a1-4a44-b5d0-5d4c274beb93
 | LED pulsing blue, slow (3 s) | **Reconnecting** — looking for a remembered controller | Turn the controller on |
 | LED steady, dimmed | **Connected** — inputs are flowing to the Switch (the level is a setting; a blink-per-input debug mode is optional) | Play |
 | Hold the button 3 s | Enter pairing mode (also available from the web console) | |
+| Short-press the button | Switch to the next paired device, wrapping at the end of the web console's list | |
 
 A few things worth knowing:
 
@@ -87,6 +88,19 @@ A few things worth knowing:
   sometimes does, without re-enumerating), the dongle re-arms its USB
   connection after 2.5 s so the Switch picks it up again.
 - **Forgot which controllers are paired?** The web console lists them by name.
+- **Choose a connection:** click *Connect* beside a paired device, or short-press
+  the dongle button to cycle through the list (sorted by identity address).
+  The choice is saved across reboots. The dongle tries that device for 10 s,
+  then resumes automatic reconnection to any paired device if unavailable.
+  A second short press during that search advances from the pending choice.
+  After connecting, the next short press advances from the connected device.
+  With no paired devices short presses do nothing; a single connected device
+  stays connected. Holding for 3 s enters pairing and releasing it does not cycle.
+  A successful pairing makes the new device the saved preference. Switching
+  releases the previous device's inputs. In HID passthrough mode, devices with
+  the same Report Map keep the USB connection up; a different Report Map is
+  saved and the dongle restarts once to enumerate with it. The selected peer
+  is saved before that restart. Keep the console's *Auto-connect* enabled.
 
 ## The web console
 
@@ -128,7 +142,9 @@ dongle on load.
   the Switch has finished the Pro Controller handshake. This is the first
   place to look for "connected but nothing happens".
 - **Paired controllers** — every bond by the name the controller reports
-  (learned when it connects), with its address and a per-row *Forget*.
+  (learned when it connects), with its address, *Connect* and *Forget*.
+  *Preferred* marks the saved choice; *connected* marks the actual live link,
+  which can differ after automatic fallback.
 - **Actions** — start pairing, forget all controllers, reboot.
 
 ### Settings
@@ -208,6 +224,24 @@ idf.py -p PORT flash monitor
 interface: the **vendor (WebUSB) interface** for the web console (default on;
 turn it off for a plain single-interface gamepad) and an optional
 **CDC-ACM serial port** carrying the logs, so `idf.py monitor` works over the same cable.
+
+For the BLE keyboard / mouse receiver from `hid-passthrough-v1`, use a separate
+build directory and configuration so an existing Switch Pro `sdkconfig` cannot
+silently override the HID defaults:
+
+```sh
+idf.py -B build_hid \
+  -D SDKCONFIG="$PWD/build_hid/sdkconfig" \
+  -D 'SDKCONFIG_DEFAULTS=sdkconfig.defaults;sdkconfig.defaults.hid_passthrough;sdkconfig.defaults.mctechnology17' \
+  -D DONGLE_EXTRA_COMPONENT_DIRS=components_hid_passthrough build
+```
+
+This builds for the T-Dongle-S3 with HID passthrough, the BIOS/UEFI boot keyboard
+and the optional ZMK logo. The image is `build_hid/esp-usb-ble-hid.bin`.
+The local `espp__usb_device` component is required for the two HID interfaces.
+The web console's *Connect dongle* supports both the Switch Pro USB identity
+(`057e:2009`) and the passthrough default (`1209:0001`); custom IDs still use
+*Pick any USB device…*.
 
 Once a dongle runs this firmware you can update it without a serial port:
 

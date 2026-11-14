@@ -21,8 +21,12 @@ std::vector<uint8_t> hid_descriptor_load();
 /// Whether the descriptor in use came from a paired device (vs. the default).
 bool hid_descriptor_is_cached();
 
-/// Store a device's Report Map. Returns true if it differs from the descriptor
-/// currently in use (the caller then restarts to enumerate with it).
+/// Whether the peer's map exactly matches this boot's USB report descriptor.
+/// A store failure must not be mistaken for an already-matching descriptor.
+bool hid_descriptor_matches(std::span<const uint8_t> report_map);
+
+/// Store a different Report Map. Returns true only when successfully persisted
+/// (the caller then restarts to enumerate with it); false also includes errors.
 bool hid_descriptor_store(std::span<const uint8_t> report_map);
 
 /// Forget the cached Report Map (back to the default descriptor on next boot).

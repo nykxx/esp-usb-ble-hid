@@ -123,42 +123,49 @@ static std::map<uint8_t, size_t> sent_lengths;
 // pending ones.
 static std::mutex output_mutex;
 static std::condition_variable output_cv;
-static std::map<uint8_t, std::vector<uint8_t>> pending_output;
+struct OutputReport {
+  uint32_t generation;
+  std::vector<uint8_t> data;
+};
+static std::map<uint8_t, OutputReport> pending_output;
 static std::unique_ptr<espp::Task> output_task;
 
 static bool output_task_fn(std::mutex &, std::condition_variable &) {
-  std::map<uint8_t, std::vector<uint8_t>> todo;
+  std::map<uint8_t, OutputReport> todo;
   {
     std::unique_lock<std::mutex> lk(output_mutex);
     output_cv.wait_for(lk, 100ms, [] { return !pending_output.empty(); });
     todo.swap(pending_output);
   }
-  for (const auto &[id, data] : todo)
-    ble_write_output_report(id, data);
+  for (const auto &[id, report] : todo)
+    ble_write_output_report(id, report.data, report.generation);
   return false; // don't stop the task
 }
 
 /********* Report Map -> USB descriptor ***************/
 
 // The device's Report Map arrived (BLE scan-timer task): enumerate with it.
-static void on_report_map(const std::vector<uint8_t> &map) {
+static bool on_report_map(const std::vector<uint8_t> &map) {
   if (map.empty()) {
-    logger.warn("device has no readable Report Map; keeping the current USB descriptor");
-    return;
+    logger.warn("device has no readable Report Map; input forwarding remains disabled");
+    return false;
   }
-  if (!hid_descriptor_store(map)) {
+  if (hid_descriptor_matches(map)) {
     hid_descriptor_reset_restart_count(); // USB already matches the device
-    return;
+    return true;
   }
   if (hid_descriptor_restart_count() >= kMaxDescriptorRestarts) {
     logger.error("Report Map changed again after {} restarts; not restarting",
                  hid_descriptor_restart_count());
-    return;
+    return false;
   }
+  if (!hid_descriptor_store(map))
+    return false; // do not forward a mismatched report layout after an NVS error
   hid_descriptor_note_restart();
   logger.info("new Report Map: restarting to enumerate with it");
   std::this_thread::sleep_for(200ms); // let the log line out
   esp_restart();
+  return false;
 }
 
 /********* bridge.hpp ***************/
@@ -199,7 +206,7 @@ UsbHidConfig bridge_usb_config() {
     }
     {
       std::lock_guard<std::mutex> lk(output_mutex);
-      pending_output[id].assign(data.begin(), data.end());
+      pending_output[id] = {ble_link_generation(), {data.begin(), data.end()}};
     }
     output_cv.notify_one();
   };
@@ -222,7 +229,8 @@ UsbHidConfig bridge_usb_config() {
       return;
     {
       std::lock_guard<std::mutex> lk(output_mutex);
-      pending_output[keyboard_layout->report_id].assign(data.begin(), data.end());
+      pending_output[keyboard_layout->report_id] = {ble_link_generation(),
+                                                    {data.begin(), data.end()}};
     }
     output_cv.notify_one();
   };
@@ -236,6 +244,8 @@ UsbHidConfig bridge_usb_config() {
 }
 
 void bridge_on_ble_report(NimBLERemoteCharacteristic *chr, const uint8_t *data, size_t length) {
+  if (!usb_is_mounted())
+    return;
   // its report id comes from the characteristic's Report Reference
   const uint8_t ble_id = ble_report_id_for(chr).value_or(1);
   const std::span<const uint8_t> report(data, length);
@@ -265,14 +275,23 @@ void bridge_on_ble_disconnect() {
     std::lock_guard<std::mutex> lk(sent_lengths_mutex);
     lengths.swap(sent_lengths);
   }
-  for (const auto &[id, len] : lengths) {
-    const std::vector<uint8_t> zeros(len, 0);
-    enqueue_hid(id, zeros);
+  {
+    std::lock_guard<std::mutex> lk(output_mutex);
+    pending_output.clear();
   }
-  if (keyboard_layout && usb_boot_protocol_active()) {
-    const std::array<uint8_t, 8> released{};
-    enqueue_hid(0, released, true);
+  {
+    std::lock_guard<std::mutex> lock(hid_tx_mutex);
+    // Release reports must not be dropped behind a full queue of old keys.
+    // The single sender may finish its in-flight report before these releases.
+    hid_tx_queue.clear();
+    if (usb_is_mounted()) {
+      for (const auto &[id, len] : lengths)
+        hid_tx_queue.push_back({false, id, std::vector<uint8_t>(len, 0)});
+      if (keyboard_layout && usb_boot_protocol_active())
+        hid_tx_queue.push_back({true, 0, std::vector<uint8_t>(8, 0)});
+    }
   }
+  hid_tx_cv.notify_one();
 }
 
 bool bridge_hid_ready() { return usb_is_mounted(); }

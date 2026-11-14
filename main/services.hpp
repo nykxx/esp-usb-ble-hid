@@ -16,6 +16,7 @@
 
 #include "dispatcher_worker.hpp"
 
+#include "connection_selection.hpp"
 #include "device_config.hpp"
 
 struct ServicesCallbacks {
@@ -29,6 +30,7 @@ struct ServicesCallbacks {
   std::function<bool(const std::array<uint8_t, 6> &address, uint8_t address_type,
                      std::string &error)>
       forget_bond{nullptr};
+  std::function<bool(const std::array<uint8_t, 6> &, uint8_t, std::string &)> select_bond{nullptr};
   /// Called whenever the settings changed (already persisted); apply them.
   std::function<void(const device_config::Settings &)> on_settings_changed{nullptr};
 };
@@ -50,6 +52,9 @@ std::string services_bond_name(const std::array<uint8_t, 6> &address);
 void services_set_bond_name(const std::array<uint8_t, 6> &address, const std::string &name);
 void services_forget_bond_name(const std::array<uint8_t, 6> &address);
 void services_clear_bond_names();
+
+std::optional<ble_control::Peer> services_preferred_peer();
+bool services_save_preferred_peer(const std::optional<ble_control::Peer> &peer, std::string &error);
 
 /// The last crash report (empty if the previous boot was clean).
 std::string services_crash_report();

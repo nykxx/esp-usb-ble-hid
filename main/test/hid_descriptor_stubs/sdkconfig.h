@@ -1,0 +1,2 @@
+#pragma once
+#define CONFIG_BRIDGE_MODE_HID_PASSTHROUGH 1
